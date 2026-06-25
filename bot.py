@@ -645,9 +645,12 @@ async def start(event):
             await event.respond("❌ Invalid task link.")
             return
         async with db_pool.acquire() as conn:
-            # Welcome bonus goes to hold_balance
-            await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6) ON CONFLICT (user_id) DO NOTHING",
-                               user_id, name, username, 0, settings['welcome_bonus'], now)
+            # Welcome bonus goes to hold_balance (but only if user doesn't exist; we'll handle via insert)
+            # But for task link, we should ensure user exists; we'll do insert if not exists
+            existing = await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1", user_id)
+            if not existing:
+                await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6)",
+                                   user_id, name, username, 0, settings['welcome_bonus'], now)
         if not await is_user_joined_all(user_id):
             async with db_pool.acquire() as conn:
                 channels = await conn.fetch("SELECT channel_username FROM required_channels")
@@ -660,8 +663,12 @@ async def start(event):
 
     # Normal /start flow
     async with db_pool.acquire() as conn:
-        user_data = await conn.fetchval("SELECT is_joined FROM users WHERE user_id=$1", user_id)
-        if msg_text.startswith('/start ') and not user_data:
+        # Check if user exists
+        existing = await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1", user_id)
+        is_new_user = False
+
+        # Process referral only if user is new and message has a referral
+        if not existing and msg_text.startswith('/start '):
             parts = msg_text.split(' ')
             if len(parts) > 1:
                 potential_ref = int(parts[1])
@@ -672,18 +679,30 @@ async def start(event):
                         await client.send_message(potential_ref, ref_alert, parse_mode='md')
                     except:
                         pass
-                    # New user: welcome bonus goes to hold_balance
-                    await conn.execute("INSERT INTO users (user_id, name, username, ref_by, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $6, $5, $7) ON CONFLICT (user_id) DO NOTHING",
+                    # Insert new user with ref_by
+                    await conn.execute("INSERT INTO users (user_id, name, username, ref_by, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $6, $5, $7)",
                                        user_id, name, username, potential_ref, 0, settings['welcome_bonus'], now)
-
-        await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6) ON CONFLICT (user_id) DO NOTHING",
-                           user_id, name, username, 0, settings['welcome_bonus'], now)
+                    is_new_user = True
+        if not existing and not is_new_user:
+            # Insert without referral
+            await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6)",
+                               user_id, name, username, 0, settings['welcome_bonus'], now)
+            is_new_user = True
+        elif existing:
+            is_new_user = False
+            # Optionally update name/username if changed
+            await conn.execute("UPDATE users SET name = $1, username = $2 WHERE user_id = $3", name, username, user_id)
 
     welcome_bonus = settings['welcome_bonus']
     currency = settings['currency']
-    welcome_msg = f"👋 Welcome {name}!"
-    if welcome_bonus > 0:
-        welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly."
+
+    # Prepare welcome message based on new user or existing
+    if is_new_user and welcome_bonus > 0:
+        welcome_msg = (f"👋 Welcome {name}!\n\n"
+                       f"🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly.")
+    else:
+        # For existing users, just a simple greeting (no bonus mention)
+        welcome_msg = f"👋 Welcome All Forwarder!"
 
     if not await is_admin(user_id) and not await is_user_joined_all(user_id):
         async with db_pool.acquire() as conn:
@@ -719,6 +738,10 @@ async def check_join_callback(event):
         settings = await get_settings()
         welcome_bonus = settings['welcome_bonus']
         currency = settings['currency']
+        # After joining, we can show the welcome with bonus if they are new? But they are already inserted.
+        # However, this is the first time they see the main menu, so we can show the bonus if it's >0.
+        # But to avoid showing again for existing users, we can check if they have already seen it? We can simply show it if bonus >0.
+        # It's okay because they might not have seen it yet (they saw join buttons before).
         welcome_msg = f"👋 Welcome {event.sender.first_name}!"
         if welcome_bonus > 0:
             welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly."
@@ -2831,7 +2854,7 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     print("🤖 Bot started!")
     asyncio.create_task(auto_approve_pending_submissions())
-    asyncio.create_task(weekly_release())  # Start weekly release background task
+    asyncio.create_task(weekly_release())
     await start_web_server()
 
 if __name__ == "__main__":
