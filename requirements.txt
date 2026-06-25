@@ -1,0 +1,4 @@
+telethon
+pytz
+aiohttp
+asyncpg
