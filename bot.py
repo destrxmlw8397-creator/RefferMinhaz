@@ -1,7 +1,7 @@
 import os
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.channels import GetParticipantRequest
@@ -32,14 +32,8 @@ processed_media = set()
 screenshot_lock = asyncio.Lock()
 task_list_msgs = {}
 admin_edit_state = {}
-
-# NEW: Admin TG Task creation state
 admin_tg_task_state = {}
-
-# NEW: Admin channel management state
 admin_channel_state = {}
-
-# NEW: Track admin user mode (True = user mode, False = admin mode)
 admin_user_mode = {MAIN_ADMIN_ID: True}
 
 # --- Database connection pool ---
@@ -55,17 +49,35 @@ async def init_db():
                 user_id BIGINT PRIMARY KEY,
                 name TEXT,
                 username TEXT,
-                balance REAL DEFAULT 0.0,
+                balance REAL DEFAULT 0.0,          -- Real balance (withdrawable)
+                hold_balance REAL DEFAULT 0.0,     -- Staking/Hold balance
                 ref_by BIGINT,
                 wallet TEXT DEFAULT 'Not Set',
                 total_ref INTEGER DEFAULT 0,
-                last_bonus INTEGER DEFAULT 0,
+                last_bonus INTEGER DEFAULT 0,      -- last daily farming claim time
                 is_joined INTEGER DEFAULT 0,
-                total_earned REAL DEFAULT 0,
+                total_earned REAL DEFAULT 0,       -- total earned from referrals+tasks (real)
                 total_withdrawn REAL DEFAULT 0,
                 join_date INTEGER DEFAULT 0,
-                claimed_milestones TEXT DEFAULT ''
+                claimed_milestones TEXT DEFAULT '',
+                last_release_time INTEGER DEFAULT 0, -- last weekly release timestamp
+                total_released REAL DEFAULT 0.0     -- total released from hold to real
             )
+        ''')
+        # Add new columns if they don't exist
+        await conn.execute('''
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='hold_balance') THEN
+                    ALTER TABLE users ADD COLUMN hold_balance REAL DEFAULT 0.0;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='last_release_time') THEN
+                    ALTER TABLE users ADD COLUMN last_release_time INTEGER DEFAULT 0;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='total_released') THEN
+                    ALTER TABLE users ADD COLUMN total_released REAL DEFAULT 0.0;
+                END IF;
+            END $$;
         ''')
         # Stats table
         await conn.execute('''
@@ -168,11 +180,6 @@ async def get_bonus_setting():
     async with db_pool.acquire() as conn:
         return await conn.fetchrow("SELECT ref_count, bonus_amount FROM bonus_setting WHERE id=1")
 
-async def ensure_required_channels_table():
-    # Already created in init
-    pass
-
-# --- Helper: Fix URL ---
 def fix_url(url):
     url = url.strip()
     if not url.startswith(('http://', 'https://')):
@@ -182,7 +189,7 @@ def fix_url(url):
 # --- KEYBOARDS ---
 main_buttons = [
     [Button.text('💰 Balance', resize=True), Button.text('👫 Invite', resize=True)],
-    [Button.text('📁 Wallet', resize=True), Button.text('🎁 Bonus', resize=True), Button.text('📤 Withdraw', resize=True)],
+    [Button.text('📁 Wallet', resize=True), Button.text('🌾 Staking', resize=True), Button.text('📤 Withdraw', resize=True)],
     [Button.text('📊 Statistics', resize=True), Button.text('📋 Task', resize=True)]
 ]
 
@@ -233,7 +240,7 @@ TASK_SETTINGS_COMMANDS = [
 ]
 
 USER_COMMANDS = [
-    "💰 Balance", "👫 Invite", "📁 Wallet", "🎁 Bonus",
+    "💰 Balance", "👫 Invite", "📁 Wallet", "🌾 Staking",
     "📤 Withdraw", "📊 Statistics", "📋 Task"
 ]
 
@@ -251,7 +258,6 @@ async def get_now():
     tz = pytz.timezone('Asia/Dhaka')
     return datetime.now(tz).strftime("%d/%m/%Y %I:%M %p")
 
-# --- Helper: Check if bot is admin ---
 async def is_bot_admin_in_channel(channel_identifier):
     try:
         entity = await client.get_entity(channel_identifier)
@@ -266,7 +272,6 @@ async def is_bot_admin_in_channel(channel_identifier):
         print(f"Error checking bot admin: {e}")
         return None
 
-# --- Helper: Check if a user is admin ---
 async def is_user_admin_in_channel(user_id, channel_entity):
     try:
         participant = await client(GetParticipantRequest(channel=channel_entity, participant=user_id))
@@ -279,7 +284,6 @@ async def is_user_admin_in_channel(user_id, channel_entity):
         print(f"Error checking user admin: {e}")
         return False
 
-# --- JOIN CHECK ---
 async def is_user_joined_all(user_id):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT channel_username FROM required_channels")
@@ -325,7 +329,7 @@ def build_channel_buttons(channels):
     rows.append([Button.inline("🟢 Joined", b"check_join")])
     return rows
 
-# --- GRANT MILESTONE BONUSES ---
+# --- GRANT MILESTONE BONUSES (go to real balance) ---
 async def grant_milestone_bonuses(user_id, sets):
     bonus_set = await get_bonus_setting()
     if not bonus_set:
@@ -354,6 +358,7 @@ async def grant_milestone_bonuses(user_id, sets):
             return
 
         total_bonus = len(new_milestones) * bonus_amt
+        # Add to real balance (balance column) because it's from referrals
         await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", total_bonus, user_id)
         all_claimed = claimed_list + new_milestones
         new_claimed_str = ','.join(map(str, all_claimed))
@@ -580,7 +585,7 @@ async def auto_approve_pending_submissions():
             async with db_pool.acquire() as conn:
                 pending = await conn.fetch("SELECT id, user_id, task_id, reward, url FROM task_submissions WHERE status='pending' AND submitted_at <= $1", current_time - 21600)
                 for sub in pending:
-                    # Approve
+                    # Approve and add to real balance (balance)
                     await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", sub['reward'], sub['user_id'])
                     await conn.execute("UPDATE task_submissions SET status='approved', reviewed_at=$1 WHERE id=$2", current_time, sub['id'])
                     currency = (await get_settings())['currency']
@@ -592,6 +597,33 @@ async def auto_approve_pending_submissions():
         except Exception as e:
             print(f"Error in auto_approve_pending_submissions: {e}")
         await asyncio.sleep(300)
+
+# --- Weekly release of hold balance to real balance ---
+async def weekly_release():
+    """Every hour, release hold balance to real balance for users with last_release_time >= 7 days."""
+    while True:
+        try:
+            now = int(time.time())
+            one_week_seconds = 7 * 24 * 3600
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT user_id, hold_balance FROM users WHERE hold_balance > 0 AND (last_release_time = 0 OR now - last_release_time >= $1)", one_week_seconds)
+                for row in rows:
+                    user_id = row['user_id']
+                    hold_amount = row['hold_balance']
+                    if hold_amount <= 0:
+                        continue
+                    # Move hold to real balance
+                    await conn.execute("UPDATE users SET balance = balance + $1, hold_balance = 0, total_released = total_released + $1, last_release_time = $2 WHERE user_id = $3",
+                                       hold_amount, now, user_id)
+                    currency = (await get_settings())['currency']
+                    try:
+                        await client.send_message(user_id, f"🔄 **Weekly Release!**\n\nYour hold balance of **{hold_amount:.2f} {currency}** has been released to your real balance. You can now withdraw it.")
+                    except:
+                        pass
+                    print(f"Released {hold_amount} for user {user_id}")
+        except Exception as e:
+            print(f"Error in weekly_release: {e}")
+        await asyncio.sleep(3600)  # check every hour
 
 # --- START COMMAND ---
 @client.on(events.NewMessage(pattern='/start'))
@@ -613,8 +645,9 @@ async def start(event):
             await event.respond("❌ Invalid task link.")
             return
         async with db_pool.acquire() as conn:
-            await conn.execute("INSERT INTO users (user_id, name, username, balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $4, $5) ON CONFLICT (user_id) DO NOTHING",
-                               user_id, name, username, settings['welcome_bonus'], now)
+            # Welcome bonus goes to hold_balance
+            await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6) ON CONFLICT (user_id) DO NOTHING",
+                               user_id, name, username, 0, settings['welcome_bonus'], now)
         if not await is_user_joined_all(user_id):
             async with db_pool.acquire() as conn:
                 channels = await conn.fetch("SELECT channel_username FROM required_channels")
@@ -639,17 +672,18 @@ async def start(event):
                         await client.send_message(potential_ref, ref_alert, parse_mode='md')
                     except:
                         pass
-                    await conn.execute("INSERT INTO users (user_id, name, username, ref_by, balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $5, $6) ON CONFLICT (user_id) DO NOTHING",
-                                       user_id, name, username, potential_ref, settings['welcome_bonus'], now)
+                    # New user: welcome bonus goes to hold_balance
+                    await conn.execute("INSERT INTO users (user_id, name, username, ref_by, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $6, $5, $7) ON CONFLICT (user_id) DO NOTHING",
+                                       user_id, name, username, potential_ref, 0, settings['welcome_bonus'], now)
 
-        await conn.execute("INSERT INTO users (user_id, name, username, balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $4, $5) ON CONFLICT (user_id) DO NOTHING",
-                           user_id, name, username, settings['welcome_bonus'], now)
+        await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6) ON CONFLICT (user_id) DO NOTHING",
+                           user_id, name, username, 0, settings['welcome_bonus'], now)
 
     welcome_bonus = settings['welcome_bonus']
     currency = settings['currency']
     welcome_msg = f"👋 Welcome {name}!"
     if welcome_bonus > 0:
-        welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}**!"
+        welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly."
 
     if not await is_admin(user_id) and not await is_user_joined_all(user_id):
         async with db_pool.acquire() as conn:
@@ -674,6 +708,7 @@ async def check_join_callback(event):
                 if ref_id:
                     settings = await get_settings()
                     ref_bonus = settings['ref_bonus']
+                    # Referral bonus goes to real balance (balance)
                     await conn.execute("UPDATE users SET balance = balance + $1, total_ref = total_ref + 1, total_earned = total_earned + $1 WHERE user_id=$2", ref_bonus, ref_id)
                     await grant_milestone_bonuses(ref_id, settings)
                     try:
@@ -686,7 +721,7 @@ async def check_join_callback(event):
         currency = settings['currency']
         welcome_msg = f"👋 Welcome {event.sender.first_name}!"
         if welcome_bonus > 0:
-            welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}**!"
+            welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly."
         await event.respond(welcome_msg, buttons=main_buttons)
     else:
         async with db_pool.acquire() as conn:
@@ -695,7 +730,7 @@ async def check_join_callback(event):
         await event.edit("⛔ You haven't joined all channels yet.\nClick each button below to join, then press 'Joined'.", buttons=rows)
         await event.answer("Please join all required channels.", alert=True)
 
-# --- ADMIN PANEL (now /panel) ---
+# --- ADMIN PANEL ---
 @client.on(events.NewMessage(pattern='/panel'))
 async def admin_panel(event):
     if not await is_admin(event.sender_id):
@@ -1172,13 +1207,15 @@ async def handle_text(event):
                 pending_requests = await conn.fetchval("SELECT COUNT(*) FROM withdraw_requests WHERE status='pending'")
                 pending_amount = await conn.fetchval("SELECT SUM(amount) FROM withdraw_requests WHERE status='pending'") or 0
                 total_balance = await conn.fetchval("SELECT SUM(balance) FROM users") or 0
+                total_hold = await conn.fetchval("SELECT SUM(hold_balance) FROM users") or 0
             currency = settings['currency']
             msg = (f"📊 **Bot Statistics**\n\n"
                    f"👥 Total Users: {total_users}\n"
                    f"💰 Total Payouts: {total_payout:.2f} {currency}\n"
                    f"⏳ Pending Withdrawals: {pending_requests} requests\n"
                    f"💵 Pending Amount: {pending_amount:.2f} {currency}\n"
-                   f"💎 Total User Balance: {total_balance:.2f} {currency}")
+                   f"💎 Total Real Balance: {total_balance:.2f} {currency}\n"
+                   f"🔄 Total Hold Balance: {total_hold:.2f} {currency}")
             await event.respond(msg)
             return
         elif text == "Broadcast":
@@ -1421,7 +1458,14 @@ async def handle_text(event):
     # --- USER COMMANDS (for all users, including admin in user mode) ---
     if text == '💰 Balance':
         currency = settings['currency']
-        msg = (f"👑 Name - {user['name']} \n🆔 UserID - `{user['user_id']}`\n💵 Balance - {user['balance']:.2f} {currency}\n\n🎉 Refer and earn more!")
+        real_bal = user['balance']
+        hold_bal = user['hold_balance']
+        total = real_bal + hold_bal
+        msg = (f"👑 Name - {user['name']} \n🆔 UserID - `{user['user_id']}`\n"
+               f"💰 **Real Balance (Withdrawable)**: {real_bal:.2f} {currency}\n"
+               f"🔄 **Hold Balance (Staking)**: {hold_bal:.2f} {currency}\n"
+               f"💎 **Total**: {total:.2f} {currency}\n\n"
+               f"🎉 Refer and earn more!")
         await event.reply(msg)
 
     elif text == '📊 Statistics':
@@ -1431,6 +1475,7 @@ async def handle_text(event):
         join_timestamp = user['join_date']
         async with db_pool.acquire() as conn:
             pending_sum = await conn.fetchval("SELECT SUM(amount) FROM withdraw_requests WHERE user_id=$1 AND status='pending'", user_id) or 0
+        total_released = user['total_released'] or 0
         if join_timestamp:
             join_date = datetime.fromtimestamp(join_timestamp).strftime("%d/%m/%Y")
         else:
@@ -1438,8 +1483,9 @@ async def handle_text(event):
         currency = settings['currency']
         msg = (f"📊 **Your Statistics**\n\n"
                f"👥 Total Referrals: {total_ref}\n"
-               f"💰 Total Earned: {total_earned:.2f} {currency}\n"
+               f"💰 Total Earned (Referrals+Tasks): {total_earned:.2f} {currency}\n"
                f"💸 Total Paid Out: {total_withdrawn:.2f} {currency}\n"
+               f"🔄 Total Released from Hold: {total_released:.2f} {currency}\n"
                f"⏳ Pending Payment: {pending_sum:.2f} {currency}\n"
                f"📅 Joined: {join_date}")
         await event.reply(msg)
@@ -1456,15 +1502,41 @@ async def handle_text(event):
         msg, kb = await get_invite_data(user_id, bot_user)
         await event.reply(msg, buttons=kb)
 
-    elif text == '🎁 Bonus':
+    elif text == '🌾 Staking':
+        # Show staking dashboard
+        hold_bal = user['hold_balance']
+        daily_bonus = settings['daily_bonus']
+        currency = settings['currency']
+        last_claim = user['last_bonus']  # reusing last_bonus for farming claim time
         now = int(time.time())
-        if now - user['last_bonus'] < 86400:
-            await event.reply("⛔ You already received bonus in the last 24 hours.")
+        next_claim_time = last_claim + 86400 if last_claim else now
+        if now >= next_claim_time:
+            can_claim = True
+            remaining = "Available now"
         else:
-            daily_bonus = settings['daily_bonus']
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE users SET balance = balance + $1, last_bonus = $2, total_earned = total_earned + $1 WHERE user_id=$3", daily_bonus, now, user_id)
-            await event.reply(f"🎁 Congrats, you received {daily_bonus} {settings['currency']}!\n\n🔍 Check back after 24 hours!")
+            can_claim = False
+            remaining = str(timedelta(seconds=next_claim_time - now))
+
+        # Weekly release info
+        last_release = user['last_release_time'] or 0
+        next_release = last_release + 7*86400 if last_release else now
+        if now >= next_release:
+            release_status = "Ready for release (will happen automatically)"
+        else:
+            release_status = f"In {str(timedelta(seconds=next_release - now))}"
+
+        total_released = user['total_released'] or 0
+
+        msg = (f"🌾 **Staking Dashboard**\n\n"
+               f"🔄 **Current Hold Balance:** {hold_bal:.2f} {currency}\n"
+               f"💰 **Daily Farming Reward:** {daily_bonus} {currency}\n"
+               f"⏳ **Next Claim Time:** {remaining}\n"
+               f"📅 **Weekly Release:** {release_status}\n"
+               f"📈 **Total Released to Real Balance:** {total_released:.2f} {currency}\n\n"
+               f"Claim your daily farming reward below.")
+        buttons = [[Button.inline("🎁 Claim Daily Reward", b"claim_farming")],
+                   [Button.inline("🔙 Back", b"back_main")]]
+        await event.reply(msg, buttons=buttons)
 
     elif text == '📤 Withdraw':
         async with db_pool.acquire() as conn:
@@ -1476,12 +1548,14 @@ async def handle_text(event):
             await event.reply("⚠️ Withdrawal is currently OFF by Admin.")
             return
         min_withdraw = settings['min_withdraw']
-        if user['balance'] < min_withdraw:
-            await event.reply(f"⚠️ Must own at least {min_withdraw} {settings['currency']} to make a withdrawal.")
+        # Check real balance only (balance column)
+        real_bal = user['balance']
+        if real_bal < min_withdraw:
+            await event.reply(f"⚠️ Must own at least {min_withdraw} {settings['currency']} in Real Balance to withdraw. Your current Real Balance is {real_bal:.2f} {settings['currency']}.")
         elif user['wallet'] == 'Not Set':
             await event.reply("🗂 You need to set your wallet first!")
         else:
-            amt = user['balance']
+            amt = real_bal
             wallet_addr = user['wallet']
             u_name = user['name']
             u_refs = user['total_ref']
@@ -1644,7 +1718,43 @@ async def callback(event):
     if user_id in waiting_users and data != "set_wallet":
         del waiting_users[user_id]
 
-    # --- Handle delete admin confirmation ---
+    # --- Staking: Claim farming reward ---
+    if data == "claim_farming":
+        if not await is_user_joined_all(user_id) and not await is_admin(user_id):
+            await event.answer("❌ You must join all required channels first.", alert=True)
+            return
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT last_bonus, hold_balance FROM users WHERE user_id=$1", user_id)
+            if not user:
+                await event.answer("❌ User not found.", alert=True)
+                return
+            last_claim = user['last_bonus']
+            now = int(time.time())
+            if last_claim and now - last_claim < 86400:
+                remaining = 86400 - (now - last_claim)
+                hours = remaining // 3600
+                minutes = (remaining % 3600) // 60
+                await event.answer(f"⏳ You can claim again in {hours}h {minutes}m.", alert=True)
+                return
+            # Add daily bonus to hold balance
+            settings = await get_settings()
+            daily_bonus = settings['daily_bonus']
+            if daily_bonus <= 0:
+                await event.answer("❌ Daily bonus is not set by admin.", alert=True)
+                return
+            await conn.execute("UPDATE users SET hold_balance = hold_balance + $1, last_bonus = $2 WHERE user_id=$3", daily_bonus, now, user_id)
+            currency = settings['currency']
+            new_hold = await conn.fetchval("SELECT hold_balance FROM users WHERE user_id=$1", user_id)
+            await event.edit(f"✅ **Claimed!**\n\nYou have received {daily_bonus:.2f} {currency} in your Hold Balance.\nNew Hold Balance: {new_hold:.2f} {currency}")
+            await event.answer("Claimed!", alert=True)
+            # Update the staking page message? We'll let user press back and reopen.
+        return
+
+    if data == "back_main":
+        await event.edit("🔙 Back to main menu.", buttons=main_buttons)
+        return
+
+    # --- Delete admin confirmation ---
     if data.startswith("del_admin_"):
         if user_id != MAIN_ADMIN_ID:
             await event.answer("❌ Only main admin can remove admins.", alert=True)
@@ -2350,13 +2460,14 @@ async def callback(event):
 
             reward = task['reward']
             currency = (await get_settings())['currency']
+            # Task reward goes to real balance
             await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
             await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
             await conn.execute("INSERT INTO task_submissions (user_id, task_id, reward, url, status, submitted_at, reviewed_at) VALUES ($1, $2, $3, $4, 'approved', $5, $5)",
                                user_id, task_id, reward, session['url'], int(time.time()))
 
         text = (f"🎉 **Task Completed!**\n\n"
-                f"You have successfully completed the TG task and earned **{reward} {currency}**.")
+                f"You have successfully completed the TG task and earned **{reward} {currency}** in your Real Balance.")
         buttons = [
             [Button.inline("🔙 Back", b"task_back")]
         ]
@@ -2397,6 +2508,7 @@ async def callback(event):
                 return
 
             if data.startswith("approve_sub_"):
+                # Add to real balance (balance)
                 await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", sub['reward'], sub['user_id'])
                 await conn.execute("UPDATE task_submissions SET status='approved', reviewed_at=$1 WHERE id=$2", int(time.time()), sub_id)
                 msg_obj = await event.get_message()
@@ -2404,7 +2516,7 @@ async def callback(event):
                 await event.edit(new_text, buttons=None)
                 currency = settings['currency']
                 try:
-                    await client.send_message(sub['user_id'], f"🎉 **Task Approved!**\n\nYour task submission has been approved and you have earned **{sub['reward']} {currency}**!")
+                    await client.send_message(sub['user_id'], f"🎉 **Task Approved!**\n\nYour task submission has been approved and you have earned **{sub['reward']} {currency}** in your Real Balance!")
                 except:
                     pass
                 await event.answer("✅ Approved and reward added.", alert=True)
@@ -2518,9 +2630,9 @@ async def callback(event):
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id=$2", amount, target_user)
         del admin_confirm[user_id]
-        await event.edit(f"✅ Added {amount:.2f} {currency} to user {target_user}.")
+        await event.edit(f"✅ Added {amount:.2f} {currency} to user {target_user} (Real Balance).")
         try:
-            await client.send_message(target_user, f"🎁 **Admin added {amount:.2f} {currency} to your balance!**")
+            await client.send_message(target_user, f"🎁 **Admin added {amount:.2f} {currency} to your Real Balance!**")
         except:
             pass
         await event.answer("Done!", alert=True)
@@ -2553,9 +2665,9 @@ async def callback(event):
                 return
             await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id=$2", amount, target_user)
         del admin_confirm[user_id]
-        await event.edit(f"✅ Cut {amount:.2f} {currency} from user {target_user}.")
+        await event.edit(f"✅ Cut {amount:.2f} {currency} from user {target_user} (Real Balance).")
         try:
-            await client.send_message(target_user, f"⚠️ **Admin deducted {amount:.2f} {currency} from your balance.**")
+            await client.send_message(target_user, f"⚠️ **Admin deducted {amount:.2f} {currency} from your Real Balance.**")
         except:
             pass
         await event.answer("Done!", alert=True)
@@ -2715,14 +2827,11 @@ async def start_web_server():
 
 # --- Main entry point ---
 async def main():
-    # Initialize database
     await init_db()
-    # Start the bot client
     await client.start(bot_token=BOT_TOKEN)
     print("🤖 Bot started!")
-    # Start auto-approve task
     asyncio.create_task(auto_approve_pending_submissions())
-    # Start web server
+    asyncio.create_task(weekly_release())  # Start weekly release background task
     await start_web_server()
 
 if __name__ == "__main__":
