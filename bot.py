@@ -22,7 +22,7 @@ if not all([API_ID, API_HASH, BOT_TOKEN, MAIN_ADMIN_ID, DATABASE_URL]):
 
 client = TelegramClient('referral_bot', API_ID, API_HASH)
 
-waiting_users = {}          # user_id -> state (e.g., 'set_wallet', 'confirm_wallet', 'withdraw_amount')
+waiting_users = {}          # user_id -> state (e.g., 'set_wallet', 'confirm_wallet', 'withdraw_amount', 'change_wallet', 'show_wallet')
 admin_waiting = {}
 admin_confirm = {}
 task_waiting = {}
@@ -35,6 +35,7 @@ admin_edit_state = {}
 admin_tg_task_state = {}
 admin_channel_state = {}
 admin_user_mode = {MAIN_ADMIN_ID: True}
+temp_wallet = {}            # store new wallet during change flow
 
 # --- Database connection pool ---
 db_pool = None
@@ -1492,67 +1493,88 @@ async def handle_text(event):
     if text.startswith('/'):
         return
 
-    # --- User wallet setting/confirmation for withdrawal ---
+    # --- User wallet/withdrawal handling ---
     if user_id in waiting_users:
+        # If user sent a command from the user menu, cancel the waiting state
         if text in USER_COMMANDS:
             del waiting_users[user_id]
-        else:
-            # State: set_wallet (first time setting)
-            if waiting_users[user_id] == 'set_wallet':
-                # Store wallet, then ask for confirmation
+            return
+
+        state = waiting_users[user_id]
+
+        # State: set_wallet (no wallet set, user sends address)
+        if state == 'set_wallet':
+            # Store wallet, then ask for confirmation
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET wallet = $1 WHERE user_id=$2", text, user_id)
+            kb = [[Button.inline("✅ Confirm Wallet", b"confirm_wallet")],
+                  [Button.inline("❌ Change", b"change_wallet")]]
+            await event.reply(f"🗂 Your wallet has been set to:\n`{text}`\n\nPlease confirm it is correct.", buttons=kb)
+            waiting_users[user_id] = 'confirm_wallet'
+
+        # State: confirm_wallet (after setting new wallet, user confirms)
+        elif state == 'confirm_wallet':
+            # This state is handled by callback, but text input here is ignored.
+            pass
+
+        # State: change_wallet (user wants to change wallet, send new address)
+        elif state == 'change_wallet':
+            # Store temporarily, ask for confirmation
+            temp_wallet[user_id] = text
+            kb = [[Button.inline("✅ Confirm", b"confirm_change_wallet")],
+                  [Button.inline("❌ Cancel", b"cancel_change_wallet")]]
+            await event.reply(f"📝 New wallet address:\n`{text}`\n\nPlease confirm.", buttons=kb)
+            waiting_users[user_id] = 'confirm_change_wallet'
+
+        # State: confirm_change_wallet (handled by callback)
+
+        # State: withdraw_amount (user sends amount)
+        elif state == 'withdraw_amount':
+            try:
+                amount = float(text)
+                if amount <= 0:
+                    await event.reply("❌ Amount must be positive. Please enter a valid number.")
+                    return
+                # Check balance and min
                 async with db_pool.acquire() as conn:
-                    await conn.execute("UPDATE users SET wallet = $1 WHERE user_id=$2", text, user_id)
-                kb = [[Button.inline("✅ Confirm Wallet", b"confirm_wallet")],
-                      [Button.inline("❌ Change", b"change_wallet")]]
-                await event.reply(f"🗂 Your wallet has been set to:\n`{text}`\n\nPlease confirm it is correct.", buttons=kb)
-                waiting_users[user_id] = 'confirm_wallet'
-            # State: withdraw_amount (waiting for amount after wallet is set)
-            elif waiting_users[user_id] == 'withdraw_amount':
-                try:
-                    amount = float(text)
-                    if amount <= 0:
-                        await event.reply("❌ Amount must be positive. Please enter a valid number.")
+                    user = await conn.fetchrow("SELECT balance, wallet FROM users WHERE user_id=$1", user_id)
+                    if not user:
+                        await event.reply("❌ User not found.")
+                        del waiting_users[user_id]
                         return
-                    # Check balance and min
-                    async with db_pool.acquire() as conn:
-                        user = await conn.fetchrow("SELECT balance, wallet FROM users WHERE user_id=$1", user_id)
-                        if not user:
-                            await event.reply("❌ User not found.")
-                            del waiting_users[user_id]
-                            return
-                        balance = user['balance']
-                        wallet = user['wallet']
-                        if amount > balance:
-                            await event.reply(f"❌ You only have {balance:.2f} {settings['currency']} in real balance. Please enter a lower amount.")
-                            return
-                        if amount < settings['min_withdraw']:
-                            await event.reply(f"❌ Minimum withdrawal is {settings['min_withdraw']} {settings['currency']}.")
-                            return
-                    # Calculate fee
-                    fee_percent = settings['withdraw_fee'] or 25.0
-                    fee = amount * (fee_percent / 100)
-                    net = amount - fee
-                    currency = settings['currency']
-                    confirm_text = (f"📤 **Withdrawal Confirmation**\n\n"
-                                    f"💰 Total Requested: {amount:.2f} {currency}\n"
-                                    f"📉 Transaction Fee ({fee_percent}%): -{fee:.2f} {currency}\n"
-                                    f"✅ Net Amount Credited: {net:.2f} {currency}\n"
-                                    f"💳 Wallet Address: `{wallet}`\n\n"
-                                    f"⚠️ Please confirm that the wallet address is correct.\n"
-                                    f"Click **Confirm** to proceed with withdrawal.")
-                    kb = [
-                        [Button.inline("✅ Confirm & Withdraw", f"confirm_withdraw_{user_id}")],
-                        [Button.inline("❌ Cancel", b"cancel_withdraw")]
-                    ]
-                    await event.reply(confirm_text, buttons=kb)
-                    # Store withdrawal data in admin_confirm
-                    admin_confirm[user_id] = {'action': 'withdraw', 'amount': amount, 'fee': fee, 'net': net, 'wallet': wallet, 'user_id': user_id}
-                    del waiting_users[user_id]  # clear state
-                except ValueError:
-                    await event.reply("❌ Invalid amount. Please enter a number (e.g., 10.5).")
-            else:
-                # Unknown state, clear
-                del waiting_users[user_id]
+                    balance = user['balance']
+                    wallet = user['wallet']
+                    if amount > balance:
+                        await event.reply(f"❌ You only have {balance:.2f} {settings['currency']} in real balance. Please enter a lower amount.")
+                        return
+                    if amount < settings['min_withdraw']:
+                        await event.reply(f"❌ Minimum withdrawal is {settings['min_withdraw']} {settings['currency']}.")
+                        return
+                # Calculate fee
+                fee_percent = settings['withdraw_fee'] or 25.0
+                fee = amount * (fee_percent / 100)
+                net = amount - fee
+                currency = settings['currency']
+                confirm_text = (f"📤 **Withdrawal Confirmation**\n\n"
+                                f"💰 Total Requested: {amount:.2f} {currency}\n"
+                                f"📉 Transaction Fee ({fee_percent}%): -{fee:.2f} {currency}\n"
+                                f"✅ Net Amount Credited: {net:.2f} {currency}\n"
+                                f"💳 Wallet Address: `{wallet}`\n\n"
+                                f"⚠️ Please confirm that the wallet address is correct.\n"
+                                f"Click **Confirm** to proceed with withdrawal.")
+                kb = [
+                    [Button.inline("✅ Confirm & Withdraw", f"confirm_withdraw_{user_id}")],
+                    [Button.inline("❌ Cancel", b"cancel_withdraw")]
+                ]
+                await event.reply(confirm_text, buttons=kb)
+                # Store withdrawal data in admin_confirm
+                admin_confirm[user_id] = {'action': 'withdraw', 'amount': amount, 'fee': fee, 'net': net, 'wallet': wallet, 'user_id': user_id}
+                del waiting_users[user_id]  # clear state
+            except ValueError:
+                await event.reply("❌ Invalid amount. Please enter a number (e.g., 10.5).")
+        else:
+            # Unknown state, clear
+            del waiting_users[user_id]
         return
 
     # --- Enforce channel join for non-admin ---
@@ -1653,15 +1675,22 @@ async def handle_text(event):
             await event.reply(f"⚠️ Your real balance ({real_bal:.2f} {settings['currency']}) is below the minimum withdrawal amount of {settings['min_withdraw']} {settings['currency']}.")
             return
 
-        # Check if wallet is set
-        if user['wallet'] == 'Not Set':
+        wallet = user['wallet']
+        if wallet == 'Not Set':
+            # No wallet set: ask to set one
             waiting_users[user_id] = 'set_wallet'
             await event.reply("🗂 You have not set your wallet address. Please send your Paytm/UPI/Bank number now.\n\nThis will be used for all future withdrawals.")
             return
         else:
-            # Ask for amount
-            waiting_users[user_id] = 'withdraw_amount'
-            await event.reply(f"💰 Your current real balance is {real_bal:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
+            # Show current wallet with options
+            kb = [
+                [Button.inline("✅ Confirm", b"withdraw_confirm")],
+                [Button.inline("✏️ Change", b"withdraw_change")],
+                [Button.inline("❌ Cancel", b"withdraw_cancel")]
+            ]
+            await event.reply(f"💳 Your current wallet address:\n`{wallet}`\n\nDo you want to proceed with this wallet?", buttons=kb)
+            # Set state to show wallet (handled by callback)
+            waiting_users[user_id] = 'show_wallet'
 
     # --- TASK SYSTEM ---
     elif text == '📋 Task':
@@ -1775,21 +1804,101 @@ async def callback(event):
     bot_obj = await client.get_me()
     is_user_admin = await is_admin(user_id)
 
-    # Handle wallet confirmation
+    # Handle wallet confirmation (from set_wallet flow)
     if data == "confirm_wallet":
-        if user_id in waiting_users:
+        if user_id in waiting_users and waiting_users[user_id] == 'confirm_wallet':
             del waiting_users[user_id]
-        await event.edit("✅ Wallet confirmed and saved.")
-        await event.answer("Wallet confirmed.", alert=True)
+            await event.edit("✅ Wallet confirmed and saved.")
+            # Now ask for withdrawal amount
+            settings = await get_settings()
+            async with db_pool.acquire() as conn:
+                user = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
+                if user:
+                    await event.respond(f"💰 Your current real balance is {user['balance']:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
+                    waiting_users[user_id] = 'withdraw_amount'
+            await event.answer("Wallet confirmed.", alert=True)
+        else:
+            await event.answer("No pending wallet confirmation.", alert=True)
         return
 
     if data == "change_wallet":
-        waiting_users[user_id] = 'set_wallet'
-        await event.edit("✏️ Please send the new wallet address:")
-        await event.answer("Send new wallet.", alert=True)
+        if user_id in waiting_users and waiting_users[user_id] == 'confirm_wallet':
+            waiting_users[user_id] = 'change_wallet'
+            await event.edit("✏️ Please send the new wallet address:")
+            await event.answer("Send new wallet.", alert=True)
+        else:
+            await event.answer("No pending wallet change.", alert=True)
         return
 
-    # Handle withdrawal confirm/cancel
+    # Handle confirm change wallet
+    if data == "confirm_change_wallet":
+        if user_id in waiting_users and waiting_users[user_id] == 'confirm_change_wallet':
+            new_wallet = temp_wallet.pop(user_id, None)
+            if not new_wallet:
+                await event.answer("No new wallet found.", alert=True)
+                return
+            # Save new wallet
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET wallet = $1 WHERE user_id=$2", new_wallet, user_id)
+            del waiting_users[user_id]
+            await event.edit("✅ Wallet updated successfully.")
+            # Now ask for amount
+            settings = await get_settings()
+            async with db_pool.acquire() as conn:
+                user = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
+                if user:
+                    await event.respond(f"💰 Your current real balance is {user['balance']:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
+                    waiting_users[user_id] = 'withdraw_amount'
+            await event.answer("Wallet updated.", alert=True)
+        else:
+            await event.answer("No pending change.", alert=True)
+        return
+
+    if data == "cancel_change_wallet":
+        if user_id in waiting_users:
+            del waiting_users[user_id]
+            temp_wallet.pop(user_id, None)
+            await event.edit("❌ Wallet change cancelled.")
+            await event.answer("Cancelled.", alert=True)
+        else:
+            await event.answer("No pending change.", alert=True)
+        return
+
+    # Handle withdraw show wallet buttons
+    if data == "withdraw_confirm":
+        if user_id in waiting_users and waiting_users[user_id] == 'show_wallet':
+            del waiting_users[user_id]
+            await event.edit("✅ Wallet confirmed. Now enter the amount you wish to withdraw.")
+            settings = await get_settings()
+            async with db_pool.acquire() as conn:
+                user = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
+                if user:
+                    await event.respond(f"💰 Your current real balance is {user['balance']:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
+                    waiting_users[user_id] = 'withdraw_amount'
+            await event.answer("Proceeding.", alert=True)
+        else:
+            await event.answer("No pending withdrawal.", alert=True)
+        return
+
+    if data == "withdraw_change":
+        if user_id in waiting_users and waiting_users[user_id] == 'show_wallet':
+            waiting_users[user_id] = 'change_wallet'
+            await event.edit("✏️ Please send the new wallet address:")
+            await event.answer("Send new wallet.", alert=True)
+        else:
+            await event.answer("No pending withdrawal.", alert=True)
+        return
+
+    if data == "withdraw_cancel":
+        if user_id in waiting_users:
+            del waiting_users[user_id]
+            await event.edit("❌ Withdrawal cancelled.")
+            await event.answer("Cancelled.", alert=True)
+        else:
+            await event.answer("No pending withdrawal.", alert=True)
+        return
+
+    # Handle withdrawal confirm/cancel (from amount confirmation)
     if data == "cancel_withdraw":
         if user_id in admin_confirm:
             del admin_confirm[user_id]
