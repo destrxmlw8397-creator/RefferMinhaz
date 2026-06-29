@@ -3043,7 +3043,12 @@ async def callback(event):
     if data == "top_list":
         async with db_pool.acquire() as conn:
             tops = await conn.fetch("SELECT user_id, total_ref FROM users ORDER BY total_ref DESC LIMIT 10")
-        top_msg = "Top Referring Users list:\n\n" + "\n".join([f"{i+1}. {t['user_id']}: 👨{t['total_ref']}" for i, t in enumerate(tops)])
+        rank_emojis = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        lines = []
+        for i, (user_id, ref_count) in enumerate(tops):
+            rank_emoji = rank_emojis[i] if i < len(rank_emojis) else f"{i+1}."
+            lines.append(f"{rank_emoji} 👉🏻 {user_id} | {ref_count}")
+        top_msg = "🏆 **Top Referring Users** 🏆\n\n" + "\n".join(lines)
         await event.edit(top_msg, buttons=[Button.inline("🔙 Back", b"back_inv")])
         return
 
