@@ -22,7 +22,7 @@ if not all([API_ID, API_HASH, BOT_TOKEN, MAIN_ADMIN_ID, DATABASE_URL]):
 
 client = TelegramClient('referral_bot', API_ID, API_HASH)
 
-waiting_users = {}
+waiting_users = {}          # user_id -> state (e.g., 'set_wallet', 'confirm_wallet', 'withdraw_amount')
 admin_waiting = {}
 admin_confirm = {}
 task_waiting = {}
@@ -49,22 +49,21 @@ async def init_db():
                 user_id BIGINT PRIMARY KEY,
                 name TEXT,
                 username TEXT,
-                balance REAL DEFAULT 0.0,          -- Real balance (withdrawable)
-                hold_balance REAL DEFAULT 0.0,     -- Staking/Hold balance
+                balance REAL DEFAULT 0.0,
+                hold_balance REAL DEFAULT 0.0,
                 ref_by BIGINT,
                 wallet TEXT DEFAULT 'Not Set',
                 total_ref INTEGER DEFAULT 0,
-                last_bonus INTEGER DEFAULT 0,      -- last daily farming claim time
+                last_bonus INTEGER DEFAULT 0,
                 is_joined INTEGER DEFAULT 0,
-                total_earned REAL DEFAULT 0,       -- total earned from referrals+tasks (real)
+                total_earned REAL DEFAULT 0,
                 total_withdrawn REAL DEFAULT 0,
                 join_date INTEGER DEFAULT 0,
                 claimed_milestones TEXT DEFAULT '',
-                last_release_time INTEGER DEFAULT 0, -- last weekly release timestamp
-                total_released REAL DEFAULT 0.0     -- total released from hold to real
+                last_release_time INTEGER DEFAULT 0,
+                total_released REAL DEFAULT 0.0
             )
         ''')
-        # Add new columns if they don't exist
         await conn.execute('''
             DO $$ 
             BEGIN
@@ -103,7 +102,6 @@ async def init_db():
                 withdraw_fee REAL DEFAULT 25.0
             )
         ''')
-        # Add withdraw_fee column if missing (for existing databases)
         await conn.execute('''
             DO $$
             BEGIN
@@ -120,7 +118,7 @@ async def init_db():
                 channel_username TEXT UNIQUE
             )
         ''')
-        # Withdraw requests - add fee_amount, net_amount, wallet if missing
+        # Withdraw requests
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS withdraw_requests (
                 id SERIAL PRIMARY KEY,
@@ -215,12 +213,12 @@ def fix_url(url):
 # --- KEYBOARDS ---
 main_buttons = [
     [Button.text('💰 Balance', resize=True), Button.text('👫 Invite', resize=True)],
-    [Button.text('🌾 Staking', resize=True), Button.text('📤 Withdraw', resize=True)],  # Removed Wallet button
+    [Button.text('🌾 Staking', resize=True), Button.text('📤 Withdraw', resize=True)],
     [Button.text('📊 Statistics', resize=True), Button.text('📋 Task', resize=True)]
 ]
 
 task_buttons = [
-    [Button.text('TG Task', resize=True), Button.text('Media Task', resize=True)],  # Removed My TG/Media Task
+    [Button.text('TG Task', resize=True), Button.text('Media Task', resize=True)],
     [Button.text('Back', resize=True)]
 ]
 
@@ -353,7 +351,7 @@ def build_channel_buttons(channels):
     rows.append([Button.inline("🟢 Joined", b"check_join")])
     return rows
 
-# --- GRANT MILESTONE BONUSES (go to real balance) ---
+# --- GRANT MILESTONE BONUSES ---
 async def grant_milestone_bonuses(user_id, sets):
     bonus_set = await get_bonus_setting()
     if not bonus_set:
@@ -382,7 +380,6 @@ async def grant_milestone_bonuses(user_id, sets):
             return
 
         total_bonus = len(new_milestones) * bonus_amt
-        # Add to real balance (balance column) because it's from referrals
         await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", total_bonus, user_id)
         all_claimed = claimed_list + new_milestones
         new_claimed_str = ','.join(map(str, all_claimed))
@@ -407,20 +404,16 @@ async def task_timer(user_id, task_id, message_id, chat_id, required_time):
             if session.get('task_type') == 'Media':
                 proof_type = session.get('proof_type', 'screenshot')
                 if proof_type == 'skip':
-                    # No proof required, directly grant reward
                     reward = session['reward']
                     async with db_pool.acquire() as conn:
-                        # Check if already claimed
                         existing = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status='approved'", user_id, task_id)
                         if existing:
                             await client.edit_message(chat_id, message_id, "✅ You have already claimed this task.")
                             return
-                        # Check limit
                         task = await conn.fetchrow("SELECT task_limit, completed_count FROM tasks WHERE id=$1", task_id)
                         if task['completed_count'] >= task['task_limit']:
                             await client.edit_message(chat_id, message_id, "❌ This task is already full.")
                             return
-                        # Grant reward to real balance
                         await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
                         await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
                         await conn.execute("INSERT INTO task_submissions (user_id, task_id, reward, url, status, submitted_at, reviewed_at) VALUES ($1, $2, $3, $4, 'approved', $5, $5)",
@@ -433,7 +426,6 @@ async def task_timer(user_id, task_id, message_id, chat_id, required_time):
                     await client.edit_message(chat_id, message_id, text, buttons=buttons)
                     session['screen'] = 'completed'
                 else:
-                    # Normal proof flow
                     text = (f"✅ **Time's up!**\n\n"
                             f"Click the **Claim Reward** button to submit your proof.")
                     buttons = [
@@ -446,7 +438,7 @@ async def task_timer(user_id, task_id, message_id, chat_id, required_time):
     except Exception as e:
         print(f"Error editing task message: {e}")
 
-# --- Helper: Get available tasks for a user (both Media and TG) ---
+# --- Helper: Get available tasks ---
 async def get_user_available_tasks(user_id):
     async with db_pool.acquire() as conn:
         tasks = await conn.fetch("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type FROM tasks WHERE status='active'")
@@ -454,7 +446,6 @@ async def get_user_available_tasks(user_id):
     for task in tasks:
         if task['completed_count'] >= task['task_limit']:
             continue
-        # Check if user already has pending/approved submission
         async with db_pool.acquire() as conn:
             sub = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 ORDER BY id DESC LIMIT 1", user_id, task['id'])
         if sub and sub in ('pending', 'approved'):
@@ -462,7 +453,7 @@ async def get_user_available_tasks(user_id):
         available.append((task['id'], task['task_type'], task['url'], task['time_required'], task['reward'], task['task_limit'], task['completed_count'], task['proof_type']))
     return available
 
-# --- Helper: Show task list (for Media and TG) ---
+# --- Helper: Show task list ---
 async def show_task_list(user_id, chat_id, msg_id=None, task_type=None):
     available = await get_user_available_tasks(user_id)
     if task_type:
@@ -485,7 +476,7 @@ async def show_task_list(user_id, chat_id, msg_id=None, task_type=None):
         else:
             await client.send_message(chat_id, f"❌ No active {task_type if task_type else ''} tasks available.")
 
-# --- Helper: Render Task Details (for Media and TG) ---
+# --- Helper: Render Task Details ---
 async def render_task_details(user_id, chat_id, msg_id):
     session = task_sessions[user_id]
     task_id = session['task_id']
@@ -552,7 +543,7 @@ async def render_task_details(user_id, chat_id, msg_id):
     session['screen'] = 'details'
     session['prev_screen'] = None
 
-# --- Helper: Send task notification to task channel (using URL button) ---
+# --- Helper: Send task notification ---
 async def send_task_notification(task_id, task_type, url, reward, task_limit, proof_type=None, time_required=None):
     settings = await get_settings()
     task_channel = settings['task_channel']
@@ -573,7 +564,7 @@ async def send_task_notification(task_id, task_type, url, reward, task_limit, pr
                 f"👥 User Limit: {task_limit}\n"
                 f"{proof_text}"
             )
-        else:  # TG Task
+        else:
             detail_text = (
                 f"📌 **New TG Task Added!**\n\n"
                 f"📢 Channel: https://t.me/{url}\n"
@@ -588,7 +579,7 @@ async def send_task_notification(task_id, task_type, url, reward, task_limit, pr
     except Exception as e:
         print(f"Error sending task notification: {e}")
 
-# --- Helper: Start a task for a user (common logic) ---
+# --- Helper: Start a task ---
 async def start_task_for_user(user_id, task_id):
     async with db_pool.acquire() as conn:
         task = await conn.fetchrow("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type, status FROM tasks WHERE id=$1", task_id)
@@ -606,7 +597,6 @@ async def start_task_for_user(user_id, task_id):
             await client.send_message(user_id, f"❌ **Already {status_text.title()}**\n\nYou have already {status_text} this task. You cannot start it again.")
             return False
 
-    # If all checks pass, start the task
     if user_id in screenshot_waiting:
         del screenshot_waiting[user_id]
 
@@ -648,7 +638,6 @@ async def auto_approve_pending_submissions():
             async with db_pool.acquire() as conn:
                 pending = await conn.fetch("SELECT id, user_id, task_id, reward, url FROM task_submissions WHERE status='pending' AND submitted_at <= $1", current_time - 21600)
                 for sub in pending:
-                    # Approve and add to real balance (balance)
                     await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", sub['reward'], sub['user_id'])
                     await conn.execute("UPDATE task_submissions SET status='approved', reviewed_at=$1 WHERE id=$2", current_time, sub['id'])
                     currency = (await get_settings())['currency']
@@ -661,9 +650,8 @@ async def auto_approve_pending_submissions():
             print(f"Error in auto_approve_pending_submissions: {e}")
         await asyncio.sleep(300)
 
-# --- Weekly release of hold balance to real balance ---
+# --- Weekly release ---
 async def weekly_release():
-    """Every hour, release hold balance to real balance for users with last_release_time >= 7 days."""
     while True:
         try:
             now = int(time.time())
@@ -675,7 +663,6 @@ async def weekly_release():
                     hold_amount = row['hold_balance']
                     if hold_amount <= 0:
                         continue
-                    # Move hold to real balance
                     await conn.execute("UPDATE users SET balance = balance + $1, hold_balance = 0, total_released = total_released + $1, last_release_time = $2 WHERE user_id = $3",
                                        hold_amount, now, user_id)
                     currency = (await get_settings())['currency']
@@ -686,7 +673,7 @@ async def weekly_release():
                     print(f"Released {hold_amount} for user {user_id}")
         except Exception as e:
             print(f"Error in weekly_release: {e}")
-        await asyncio.sleep(3600)  # check every hour
+        await asyncio.sleep(3600)
 
 # --- START COMMAND ---
 @client.on(events.NewMessage(pattern='/start'))
@@ -708,8 +695,6 @@ async def start(event):
             await event.respond("❌ Invalid task link.")
             return
         async with db_pool.acquire() as conn:
-            # Welcome bonus goes to hold_balance (but only if user doesn't exist; we'll handle via insert)
-            # But for task link, we should ensure user exists; we'll do insert if not exists
             existing = await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1", user_id)
             if not existing:
                 await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6)",
@@ -724,13 +709,10 @@ async def start(event):
         await start_task_for_user(user_id, task_id)
         return
 
-    # Normal /start flow
     async with db_pool.acquire() as conn:
-        # Check if user exists
         existing = await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1", user_id)
         is_new_user = False
 
-        # Process referral only if user is new and message has a referral
         if not existing and msg_text.startswith('/start '):
             parts = msg_text.split(' ')
             if len(parts) > 1:
@@ -742,29 +724,24 @@ async def start(event):
                         await client.send_message(potential_ref, ref_alert, parse_mode='md')
                     except:
                         pass
-                    # Insert new user with ref_by
                     await conn.execute("INSERT INTO users (user_id, name, username, ref_by, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $6, $5, $7)",
                                        user_id, name, username, potential_ref, 0, settings['welcome_bonus'], now)
                     is_new_user = True
         if not existing and not is_new_user:
-            # Insert without referral
             await conn.execute("INSERT INTO users (user_id, name, username, balance, hold_balance, total_earned, join_date) VALUES ($1, $2, $3, $4, $5, $4, $6)",
                                user_id, name, username, 0, settings['welcome_bonus'], now)
             is_new_user = True
         elif existing:
             is_new_user = False
-            # Optionally update name/username if changed
             await conn.execute("UPDATE users SET name = $1, username = $2 WHERE user_id = $3", name, username, user_id)
 
     welcome_bonus = settings['welcome_bonus']
     currency = settings['currency']
 
-    # Prepare welcome message based on new user or existing
     if is_new_user and welcome_bonus > 0:
         welcome_msg = (f"👋 Welcome {name}!\n\n"
                        f"🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly.")
     else:
-        # For existing users, just a simple greeting (no bonus mention)
         welcome_msg = f"👋 Welcome All Forwarder!"
 
     if not await is_admin(user_id) and not await is_user_joined_all(user_id):
@@ -790,7 +767,6 @@ async def check_join_callback(event):
                 if ref_id:
                     settings = await get_settings()
                     ref_bonus = settings['ref_bonus']
-                    # Referral bonus goes to real balance (balance)
                     await conn.execute("UPDATE users SET balance = balance + $1, total_ref = total_ref + 1, total_earned = total_earned + $1 WHERE user_id=$2", ref_bonus, ref_id)
                     await grant_milestone_bonuses(ref_id, settings)
                     try:
@@ -801,10 +777,6 @@ async def check_join_callback(event):
         settings = await get_settings()
         welcome_bonus = settings['welcome_bonus']
         currency = settings['currency']
-        # After joining, we can show the welcome with bonus if they are new? But they are already inserted.
-        # However, this is the first time they see the main menu, so we can show the bonus if it's >0.
-        # But to avoid showing again for existing users, we can check if they have already seen it? We can simply show it if bonus >0.
-        # It's okay because they might not have seen it yet (they saw join buttons before).
         welcome_msg = f"👋 Welcome {event.sender.first_name}!"
         if welcome_bonus > 0:
             welcome_msg += f"\n\n🎉 **Congratulations!** You have received a Welcome Bonus of **{welcome_bonus:.2f} {currency}** in your Hold Balance. It will be released weekly."
@@ -1525,19 +1497,62 @@ async def handle_text(event):
         if text in USER_COMMANDS:
             del waiting_users[user_id]
         else:
-            # This is when user sent wallet address for setting/confirmation
+            # State: set_wallet (first time setting)
             if waiting_users[user_id] == 'set_wallet':
                 # Store wallet, then ask for confirmation
                 async with db_pool.acquire() as conn:
                     await conn.execute("UPDATE users SET wallet = $1 WHERE user_id=$2", text, user_id)
-                # Confirm to user
                 kb = [[Button.inline("✅ Confirm Wallet", b"confirm_wallet")],
                       [Button.inline("❌ Change", b"change_wallet")]]
                 await event.reply(f"🗂 Your wallet has been set to:\n`{text}`\n\nPlease confirm it is correct.", buttons=kb)
-                waiting_users[user_id] = 'confirm_wallet'  # change state
-            elif waiting_users[user_id] == 'confirm_wallet':
-                # They sent another text while in confirm state? Shouldn't happen, but ignore.
-                pass
+                waiting_users[user_id] = 'confirm_wallet'
+            # State: withdraw_amount (waiting for amount after wallet is set)
+            elif waiting_users[user_id] == 'withdraw_amount':
+                try:
+                    amount = float(text)
+                    if amount <= 0:
+                        await event.reply("❌ Amount must be positive. Please enter a valid number.")
+                        return
+                    # Check balance and min
+                    async with db_pool.acquire() as conn:
+                        user = await conn.fetchrow("SELECT balance, wallet FROM users WHERE user_id=$1", user_id)
+                        if not user:
+                            await event.reply("❌ User not found.")
+                            del waiting_users[user_id]
+                            return
+                        balance = user['balance']
+                        wallet = user['wallet']
+                        if amount > balance:
+                            await event.reply(f"❌ You only have {balance:.2f} {settings['currency']} in real balance. Please enter a lower amount.")
+                            return
+                        if amount < settings['min_withdraw']:
+                            await event.reply(f"❌ Minimum withdrawal is {settings['min_withdraw']} {settings['currency']}.")
+                            return
+                    # Calculate fee
+                    fee_percent = settings['withdraw_fee'] or 25.0
+                    fee = amount * (fee_percent / 100)
+                    net = amount - fee
+                    currency = settings['currency']
+                    confirm_text = (f"📤 **Withdrawal Confirmation**\n\n"
+                                    f"💰 Total Requested: {amount:.2f} {currency}\n"
+                                    f"📉 Transaction Fee ({fee_percent}%): -{fee:.2f} {currency}\n"
+                                    f"✅ Net Amount Credited: {net:.2f} {currency}\n"
+                                    f"💳 Wallet Address: `{wallet}`\n\n"
+                                    f"⚠️ Please confirm that the wallet address is correct.\n"
+                                    f"Click **Confirm** to proceed with withdrawal.")
+                    kb = [
+                        [Button.inline("✅ Confirm & Withdraw", f"confirm_withdraw_{user_id}")],
+                        [Button.inline("❌ Cancel", b"cancel_withdraw")]
+                    ]
+                    await event.reply(confirm_text, buttons=kb)
+                    # Store withdrawal data in admin_confirm
+                    admin_confirm[user_id] = {'action': 'withdraw', 'amount': amount, 'fee': fee, 'net': net, 'wallet': wallet, 'user_id': user_id}
+                    del waiting_users[user_id]  # clear state
+                except ValueError:
+                    await event.reply("❌ Invalid amount. Please enter a number (e.g., 10.5).")
+            else:
+                # Unknown state, clear
+                del waiting_users[user_id]
         return
 
     # --- Enforce channel join for non-admin ---
@@ -1550,7 +1565,7 @@ async def handle_text(event):
     if not user:
         return
 
-    # --- USER COMMANDS (for all users, including admin in user mode) ---
+    # --- USER COMMANDS ---
     if text == '💰 Balance':
         currency = settings['currency']
         real_bal = user['balance']
@@ -1591,11 +1606,10 @@ async def handle_text(event):
         await event.reply(msg, buttons=kb)
 
     elif text == '🌾 Staking':
-        # Show staking dashboard
         hold_bal = user['hold_balance']
         daily_bonus = settings['daily_bonus']
         currency = settings['currency']
-        last_claim = user['last_bonus']  # reusing last_bonus for farming claim time
+        last_claim = user['last_bonus']
         now = int(time.time())
         next_claim_time = last_claim + 86400 if last_claim else now
         if now >= next_claim_time:
@@ -1605,7 +1619,6 @@ async def handle_text(event):
             can_claim = False
             remaining = str(timedelta(seconds=next_claim_time - now))
 
-        # Weekly release info
         last_release = user['last_release_time'] or 0
         next_release = last_release + 7*86400 if last_release else now
         if now >= next_release:
@@ -1635,41 +1648,20 @@ async def handle_text(event):
         if settings['withdraw_status'] == 0:
             await event.reply("⚠️ Withdrawal is currently OFF by Admin.")
             return
-        min_withdraw = settings['min_withdraw']
         real_bal = user['balance']
-        if real_bal < min_withdraw:
-            await event.reply(f"⚠️ Must own at least {min_withdraw} {settings['currency']} in Real Balance to withdraw. Your current Real Balance is {real_bal:.2f} {settings['currency']}.")
+        if real_bal < settings['min_withdraw']:
+            await event.reply(f"⚠️ Your real balance ({real_bal:.2f} {settings['currency']}) is below the minimum withdrawal amount of {settings['min_withdraw']} {settings['currency']}.")
             return
 
-        # Check if wallet is set; if not, ask to set it
+        # Check if wallet is set
         if user['wallet'] == 'Not Set':
-            # Ask user to set wallet
             waiting_users[user_id] = 'set_wallet'
             await event.reply("🗂 You have not set your wallet address. Please send your Paytm/UPI/Bank number now.\n\nThis will be used for all future withdrawals.")
             return
         else:
-            # Confirm wallet
-            wallet = user['wallet']
-            # Show withdraw summary and ask for confirmation
-            fee_percent = settings['withdraw_fee'] or 25.0
-            fee = real_bal * (fee_percent / 100)
-            net = real_bal - fee
-            currency = settings['currency']
-            confirm_text = (f"📤 **Withdrawal Confirmation**\n\n"
-                            f"💰 Total Requested: {real_bal:.2f} {currency}\n"
-                            f"📉 Transaction Fee ({fee_percent}%): -{fee:.2f} {currency}\n"
-                            f"✅ Net Amount Credited: {net:.2f} {currency}\n"
-                            f"💳 Wallet Address: `{wallet}`\n\n"
-                            f"⚠️ Please confirm that the wallet address is correct.\n"
-                            f"Click **Confirm** to proceed with withdrawal.")
-            kb = [
-                [Button.inline("✅ Confirm & Withdraw", f"confirm_withdraw_{user_id}")],
-                [Button.inline("❌ Cancel", b"cancel_withdraw")]
-            ]
-            await event.reply(confirm_text, buttons=kb)
-            # Store the withdrawal data in a temporary dict
-            admin_confirm[user_id] = {'action': 'withdraw', 'amount': real_bal, 'fee': fee, 'net': net, 'wallet': wallet, 'user_id': user_id}
-            return
+            # Ask for amount
+            waiting_users[user_id] = 'withdraw_amount'
+            await event.reply(f"💰 Your current real balance is {real_bal:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
 
     # --- TASK SYSTEM ---
     elif text == '📋 Task':
@@ -1785,7 +1777,6 @@ async def callback(event):
 
     # Handle wallet confirmation
     if data == "confirm_wallet":
-        # User confirmed wallet, remove from waiting_users and show message
         if user_id in waiting_users:
             del waiting_users[user_id]
         await event.edit("✅ Wallet confirmed and saved.")
@@ -1793,7 +1784,6 @@ async def callback(event):
         return
 
     if data == "change_wallet":
-        # User wants to change wallet, ask again
         waiting_users[user_id] = 'set_wallet'
         await event.edit("✏️ Please send the new wallet address:")
         await event.answer("Send new wallet.", alert=True)
@@ -1808,7 +1798,6 @@ async def callback(event):
         return
 
     if data.startswith("confirm_withdraw_"):
-        # Actually process withdrawal
         if user_id not in admin_confirm or admin_confirm[user_id].get('action') != 'withdraw':
             await event.answer("❌ No pending withdrawal.", alert=True)
             return
@@ -1822,7 +1811,9 @@ async def callback(event):
             await event.answer("❌ Invalid user.", alert=True)
             return
 
-        # Check balance again
+        # Fetch settings here to avoid UnboundLocalError
+        settings = await get_settings()
+
         async with db_pool.acquire() as conn:
             current_balance = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
             if current_balance < amount:
@@ -1830,13 +1821,10 @@ async def callback(event):
                 del admin_confirm[user_id]
                 return
 
-            # Deduct full amount from balance
             await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id=$2", amount, user_id)
-            # Insert withdraw request with total, fee, net
             request_time = int(time.time())
             await conn.execute("INSERT INTO withdraw_requests (user_id, amount, fee_amount, net_amount, wallet, request_time, status) VALUES ($1, $2, $3, $4, $5, $6, 'pending')",
                                user_id, amount, fee, net, wallet, request_time)
-            # Get the request id
             req_id = await conn.fetchval("SELECT id FROM withdraw_requests WHERE user_id=$1 AND request_time=$2 AND amount=$3", user_id, request_time, amount)
 
         del admin_confirm[user_id]
@@ -1847,8 +1835,7 @@ async def callback(event):
                          f"Your request is pending approval. You will be notified once processed.")
         await event.answer("Request submitted.", alert=True)
 
-        # Send to withdrawal channel with new format
-        settings = await get_settings()
+        # Send to withdrawal channel
         withdrawal_channel = settings['withdrawal_channel']
         if not withdrawal_channel:
             await event.respond("❌ Withdrawal channel not set. Please contact admin.")
@@ -1890,7 +1877,6 @@ async def callback(event):
                 minutes = (remaining % 3600) // 60
                 await event.answer(f"⏳ You can claim again in {hours}h {minutes}m.", alert=True)
                 return
-            # Add daily bonus to hold balance
             settings = await get_settings()
             daily_bonus = settings['daily_bonus']
             if daily_bonus <= 0:
@@ -1901,7 +1887,6 @@ async def callback(event):
             new_hold = await conn.fetchval("SELECT hold_balance FROM users WHERE user_id=$1", user_id)
             await event.edit(f"✅ **Claimed!**\n\nYou have received {daily_bonus:.2f} {currency} in your Hold Balance.\nNew Hold Balance: {new_hold:.2f} {currency}")
             await event.answer("Claimed!", alert=True)
-            # Update the staking page message? We'll let user press back and reopen.
         return
 
     if data == "back_main":
@@ -2392,7 +2377,6 @@ async def callback(event):
                 await client.edit_message(event.chat_id, event.message_id, f"❌ **Already {status_text.title()}**\n\nYou have already {status_text} this task. You cannot start it again.")
                 return
 
-        # All checks passed – start the task in the current message
         if user_id in screenshot_waiting:
             del screenshot_waiting[user_id]
 
@@ -2510,10 +2494,7 @@ async def callback(event):
             await event.answer("❌ Task mismatch.", alert=True)
             return
 
-        # Check if proof_type is skip? But this is only called for non-skip tasks, because skip tasks are auto-completed.
-        # Nevertheless, we can double-check.
         if session.get('proof_type') == 'skip':
-            # This shouldn't happen, but handle gracefully
             await event.answer("✅ This task does not require proof.", alert=True)
             return
 
@@ -2621,7 +2602,6 @@ async def callback(event):
 
             reward = task['reward']
             currency = (await get_settings())['currency']
-            # Task reward goes to real balance
             await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
             await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
             await conn.execute("INSERT INTO task_submissions (user_id, task_id, reward, url, status, submitted_at, reviewed_at) VALUES ($1, $2, $3, $4, 'approved', $5, $5)",
@@ -2669,7 +2649,6 @@ async def callback(event):
                 return
 
             if data.startswith("approve_sub_"):
-                # Add to real balance (balance)
                 await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", sub['reward'], sub['user_id'])
                 await conn.execute("UPDATE task_submissions SET status='approved', reviewed_at=$1 WHERE id=$2", int(time.time()), sub_id)
                 msg_obj = await event.get_message()
@@ -2919,14 +2898,14 @@ async def callback(event):
                 return
             target_user, total, fee, net, wallet, req_time = req['user_id'], req['amount'], req['fee_amount'], req['net_amount'], req['wallet'], req['request_time']
             request_time_str = datetime.fromtimestamp(req_time).strftime("%d/%m/%Y %I:%M %p")
-            currency = (await get_settings())['currency']
+            settings = await get_settings()
+            currency = settings['currency']
 
             await conn.execute("UPDATE withdraw_requests SET status='paid', paid_time=$1 WHERE id=$2", int(time.time()), req_id)
-            await conn.execute("UPDATE users SET total_withdrawn = total_withdrawn + $1 WHERE user_id=$2", net, target_user)  # Add net to total withdrawn
+            await conn.execute("UPDATE users SET total_withdrawn = total_withdrawn + $1 WHERE user_id=$2", net, target_user)
             await conn.execute("UPDATE stats SET total_payout = total_payout + $1 WHERE id=1", net)
 
         msg_obj = await event.get_message()
-        # Add new lines to the message
         new_text = msg_obj.text + f"\n\nAdd transactions link\n🛡 Status: 100% Verified & Paid"
         await event.edit(new_text, buttons=None)
 
@@ -2978,7 +2957,6 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"🌐 Web server running on port {port}")
-    # Keep the server running
     await asyncio.Event().wait()
 
 # --- Main entry point ---
