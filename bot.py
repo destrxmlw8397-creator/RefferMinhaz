@@ -103,6 +103,15 @@ async def init_db():
                 withdraw_fee REAL DEFAULT 25.0
             )
         ''')
+        # Add withdraw_fee column if missing (for existing databases)
+        await conn.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='settings' AND column_name='withdraw_fee') THEN
+                    ALTER TABLE settings ADD COLUMN withdraw_fee REAL DEFAULT 25.0;
+                END IF;
+            END $$;
+        ''')
         await conn.execute("INSERT INTO settings (id, welcome_bonus, ref_bonus, daily_bonus, currency, min_withdraw, task_proof_channel, withdrawal_channel, task_channel, withdraw_fee) VALUES (1, 0, 0, 0, 'BDT', 20, '', '', '', 25.0) ON CONFLICT (id) DO NOTHING")
         # Required channels
         await conn.execute('''
@@ -111,12 +120,12 @@ async def init_db():
                 channel_username TEXT UNIQUE
             )
         ''')
-        # Withdraw requests - add fee_amount and net_amount
+        # Withdraw requests - add fee_amount, net_amount, wallet if missing
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS withdraw_requests (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
-                amount REAL,              -- total requested
+                amount REAL,
                 fee_amount REAL DEFAULT 0,
                 net_amount REAL DEFAULT 0,
                 wallet TEXT,
@@ -125,7 +134,6 @@ async def init_db():
                 paid_time INTEGER
             )
         ''')
-        # Check if new columns exist and add if not
         await conn.execute('''
             DO $$
             BEGIN
