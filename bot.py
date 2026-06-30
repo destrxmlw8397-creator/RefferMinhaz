@@ -3050,29 +3050,8 @@ async def callback(event):
             await event.edit("❌ No users found.", buttons=[Button.inline("🔙 Back", b"back_inv")])
             return
 
-        # Build header
-        header = f"🏆 Top 25 Referral Leaders\n\n💰 {currency} Prize Pool\n\n"
-        header += "🥇 1st — 5,000 TRX 🪙\n"
-        header += "🥈 2nd — 3,000 TRX 🪙\n"
-        header += "🥉 3rd — 2,000 TRX 🪙\n"
-        header += "4th–10th — 1,500 TRX 🪙\n"
-        header += "11th–20th — 1,000 TRX 🪙\n"
-        header += "21st–25th — 500 TRX 🪙\n\n"
-        header += "━━━━━━━━━━━━━━━━\n\n"
-
-        # Build user lines
+        header = f"🏆 Top 25 Referral Leaders\n\n📊 Ranking by Referrals\n\n"
         lines = []
-        rank_emojis = ["🥇", "🥈", "🥉"] + [f"{i+1}." for i in range(3, 10)]  # 4th to 10th use numbers with dot
-        # For ranks 1-10 we can use emojis, but for simplicity we'll use numbers for all after 3
-        prize_tiers = {
-            (1, 1): 5000,
-            (2, 2): 3000,
-            (3, 3): 2000,
-            (4, 10): 1500,
-            (11, 20): 1000,
-            (21, 25): 500
-        }
-
         for i, row in enumerate(tops, start=1):
             user_id = row['user_id']
             name = row['name']
@@ -3088,13 +3067,6 @@ async def callback(event):
             else:
                 display = str(user_id)
 
-            # Determine prize
-            prize = 0
-            for (lo, hi), amount in prize_tiers.items():
-                if lo <= i <= hi:
-                    prize = amount
-                    break
-
             # Rank display
             if i == 1:
                 rank_str = "🥇"
@@ -3105,7 +3077,7 @@ async def callback(event):
             else:
                 rank_str = f"{i}."
 
-            lines.append(f"{rank_str} {display} — {total_ref} refs · {prize:,} {currency} 🪙")
+            lines.append(f"{rank_str} {display} — {total_ref} refs · {total_earned:.2f} {currency}")
 
         top_msg = header + "\n".join(lines) + "\n\n📊 Rankings update in real-time. Keep inviting to climb the leaderboard! 🚀"
         await event.edit(top_msg, buttons=[Button.inline("🔙 Back", b"back_inv")])
