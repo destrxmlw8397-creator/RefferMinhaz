@@ -3041,14 +3041,72 @@ async def callback(event):
         return
 
     if data == "top_list":
+        settings = await get_settings()
+        currency = settings['currency']
         async with db_pool.acquire() as conn:
-            tops = await conn.fetch("SELECT user_id, total_ref FROM users ORDER BY total_ref DESC LIMIT 10")
-        rank_emojis = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            tops = await conn.fetch("SELECT user_id, name, username, total_ref FROM users ORDER BY total_ref DESC LIMIT 25")
+        if not tops:
+            await event.edit("No users found.", buttons=[Button.inline("🔙 Back", b"back_inv")])
+            return
+
+        # Define prize tiers
+        prize_tiers = {
+            (1, 1): 5000,
+            (2, 2): 3000,
+            (3, 3): 2000,
+            (4, 10): 1500,
+            (11, 20): 1000,
+            (21, 25): 500
+        }
+
+        # Build header
+        header = f"🏆 Top 25 Referral Leaders\n\n💰 {currency} Prize Pool\n\n"
+        header += "🥇 1st — 5,000 TRX 🪙\n"
+        header += "🥈 2nd — 3,000 TRX 🪙\n"
+        header += "🥉 3rd — 2,000 TRX 🪙\n"
+        header += "4th–10th — 1,500 TRX 🪙\n"
+        header += "11th–20th — 1,000 TRX 🪙\n"
+        header += "21st–25th — 500 TRX 🪙\n\n"
+        header += "━━━━━━━━━━━━━━━━\n\n"
+
+        # Build user lines
         lines = []
-        for i, (user_id, ref_count) in enumerate(tops):
-            rank_emoji = rank_emojis[i] if i < len(rank_emojis) else f"{i+1}."
-            lines.append(f"{rank_emoji} 👉🏻 {user_id} | {ref_count}")
-        top_msg = "🏆 **Top Referring Users** 🏆\n\n" + "\n".join(lines)
+        rank_emojis = ["🥇", "🥈", "🥉"] + [f"{i+1}." for i in range(3, 10)]  # 4th to 10th use numbers with dot
+        # For ranks 1-10 we can use emojis, but for simplicity we'll use numbers for all after 3
+        for i, row in enumerate(tops, start=1):
+            user_id = row['user_id']
+            name = row['name']
+            username = row['username']
+            total_ref = row['total_ref']
+
+            # Determine display name
+            if username and username != "No Username":
+                display = f"@{username}"
+            elif name and name != "Unknown":
+                display = name
+            else:
+                display = str(user_id)
+
+            # Determine prize
+            prize = 0
+            for (lo, hi), amount in prize_tiers.items():
+                if lo <= i <= hi:
+                    prize = amount
+                    break
+
+            # Rank display
+            if i == 1:
+                rank_str = "🥇"
+            elif i == 2:
+                rank_str = "🥈"
+            elif i == 3:
+                rank_str = "🥉"
+            else:
+                rank_str = f"{i}."
+
+            lines.append(f"{rank_str} {display} — {total_ref} refs · {prize:,} {currency} 🪙")
+
+        top_msg = header + "\n".join(lines) + "\n\n📊 Rankings update in real-time. Keep inviting to climb the leaderboard! 🚀"
         await event.edit(top_msg, buttons=[Button.inline("🔙 Back", b"back_inv")])
         return
 
