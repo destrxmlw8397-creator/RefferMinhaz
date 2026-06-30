@@ -3043,21 +3043,12 @@ async def callback(event):
     if data == "top_list":
         settings = await get_settings()
         currency = settings['currency']
+        # Get top 25 users by total_ref descending, fetch name, username, total_ref, total_earned
         async with db_pool.acquire() as conn:
-            tops = await conn.fetch("SELECT user_id, name, username, total_ref FROM users ORDER BY total_ref DESC LIMIT 25")
+            tops = await conn.fetch("SELECT user_id, name, username, total_ref, total_earned FROM users ORDER BY total_ref DESC LIMIT 25")
         if not tops:
-            await event.edit("No users found.", buttons=[Button.inline("🔙 Back", b"back_inv")])
+            await event.edit("❌ No users found.", buttons=[Button.inline("🔙 Back", b"back_inv")])
             return
-
-        # Define prize tiers
-        prize_tiers = {
-            (1, 1): 5000,
-            (2, 2): 3000,
-            (3, 3): 2000,
-            (4, 10): 1500,
-            (11, 20): 1000,
-            (21, 25): 500
-        }
 
         # Build header
         header = f"🏆 Top 25 Referral Leaders\n\n💰 {currency} Prize Pool\n\n"
@@ -3073,11 +3064,21 @@ async def callback(event):
         lines = []
         rank_emojis = ["🥇", "🥈", "🥉"] + [f"{i+1}." for i in range(3, 10)]  # 4th to 10th use numbers with dot
         # For ranks 1-10 we can use emojis, but for simplicity we'll use numbers for all after 3
+        prize_tiers = {
+            (1, 1): 5000,
+            (2, 2): 3000,
+            (3, 3): 2000,
+            (4, 10): 1500,
+            (11, 20): 1000,
+            (21, 25): 500
+        }
+
         for i, row in enumerate(tops, start=1):
             user_id = row['user_id']
             name = row['name']
             username = row['username']
             total_ref = row['total_ref']
+            total_earned = row['total_earned']
 
             # Determine display name
             if username and username != "No Username":
