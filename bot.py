@@ -10,11 +10,15 @@ import pytz
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.errors import UserNotParticipantError
-from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
+from telethon.tl.types import (
+    ChannelParticipantAdmin, ChannelParticipantCreator,
+    KeyboardButtonSimpleWebView, ReplyInlineMarkup, KeyboardButtonRow
+)
 from aiohttp import web
 import asyncpg
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -24,6 +28,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MAIN_ADMIN_ID = int(os.environ.get("MAIN_ADMIN_ID", 0))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+WEB_APP_URL = "https://refferminhaz.onrender.com"  # আপনার ডোমেইন
 
 if not all([API_ID, API_HASH, BOT_TOKEN, MAIN_ADMIN_ID, DATABASE_URL]):
     raise ValueError("Missing required environment variables")
@@ -49,16 +54,19 @@ temp_wallet = {}
 # --- Database pool ---
 db_pool = None
 
-# --- FastAPI app for task system ---
+# --- FastAPI app ---
 fastapi_app = FastAPI()
-
-# CORS
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Production এ আপনার ডোমেইন সেট করুন
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Serve index.html ---
+@fastapi_app.get("/")
+async def root():
+    return FileResponse("index.html")
 
 # --- Pydantic models ---
 class TaskVerifyRequest(BaseModel):
@@ -215,7 +223,6 @@ async def init_db():
                 END IF;
             END $$;
         ''')
-        # Stats table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS stats (
                 id INTEGER PRIMARY KEY,
@@ -223,7 +230,6 @@ async def init_db():
             )
         ''')
         await conn.execute("INSERT INTO stats (id, total_payout) VALUES (1, 0.000) ON CONFLICT (id) DO NOTHING")
-        # Settings table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 id INTEGER PRIMARY KEY,
@@ -248,14 +254,12 @@ async def init_db():
             END $$;
         ''')
         await conn.execute("INSERT INTO settings (id, welcome_bonus, ref_bonus, daily_bonus, currency, min_withdraw, task_proof_channel, withdrawal_channel, task_channel, withdraw_fee) VALUES (1, 0, 0, 0, 'BDT', 20, '', '', '', 25.0) ON CONFLICT (id) DO NOTHING")
-        # Required channels
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS required_channels (
                 id SERIAL PRIMARY KEY,
                 channel_username TEXT UNIQUE
             )
         ''')
-        # Withdraw requests
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS withdraw_requests (
                 id SERIAL PRIMARY KEY,
@@ -283,7 +287,6 @@ async def init_db():
                 END IF;
             END $$;
         ''')
-        # Bonus setting
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS bonus_setting (
                 id INTEGER PRIMARY KEY,
@@ -292,7 +295,6 @@ async def init_db():
             )
         ''')
         await conn.execute("INSERT INTO bonus_setting (id, ref_count, bonus_amount) VALUES (1, 0, 0) ON CONFLICT (id) DO NOTHING")
-        # Tasks table
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
                 id SERIAL PRIMARY KEY,
@@ -308,7 +310,6 @@ async def init_db():
                 link TEXT
             )
         ''')
-        # Task submissions
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS task_submissions (
                 id SERIAL PRIMARY KEY,
@@ -321,7 +322,6 @@ async def init_db():
                 reviewed_at INTEGER
             )
         ''')
-        # User tasks (for web app)
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_tasks (
                 id SERIAL PRIMARY KEY,
@@ -333,7 +333,6 @@ async def init_db():
                 UNIQUE(user_id, task_id)
             )
         ''')
-        # Admins
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id BIGINT PRIMARY KEY
@@ -360,12 +359,13 @@ def fix_url(url):
         return 'https://' + url
     return url
 
-# --- KEYBOARDS ---
+# --- KEYBOARDS (Web App button fixed) ---
+# We'll use a mix of Button.text (from Telethon helper) and raw KeyboardButtonSimpleWebView
 main_buttons = [
     [Button.text('💰 Balance', resize=True), Button.text('👫 Invite', resize=True)],
     [Button.text('🌾 Staking', resize=True), Button.text('📤 Withdraw', resize=True)],
     [Button.text('📊 Statistics', resize=True), Button.text('📋 Task', resize=True)],
-    [Button.web_app("🎯 Earn", "https://yourdomain.com")]  # আপনার ডোমেইন সেট করুন
+    [KeyboardButtonSimpleWebView("🎯 Earn", WEB_APP_URL)]
 ]
 
 task_buttons = [
@@ -3168,23 +3168,7 @@ async def callback(event):
         await event.edit(msg, buttons=kb)
         return
 
-# --- Web server for health checks ---
-async def health(request):
-    return web.Response(text="OK")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health)
-    app.router.add_get('/health', health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get('PORT', 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Web server running on port {port}")
-    await asyncio.Event().wait()
-
-# --- Main entry point ---
+# --- Main entry ---
 async def main():
     await init_db()
     await client.start(bot_token=BOT_TOKEN)
@@ -3192,7 +3176,7 @@ async def main():
     asyncio.create_task(auto_approve_pending_submissions())
     asyncio.create_task(weekly_release())
 
-    # FastAPI server (Uvicorn) চালান
+    # FastAPI with Uvicorn
     config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), loop="asyncio")
     server = uvicorn.Server(config)
     await server.serve()
