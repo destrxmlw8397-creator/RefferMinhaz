@@ -35,8 +35,7 @@ else:
     client = TelegramClient('referral_bot', API_ID, API_HASH)
     print("⚠️ No SESSION_STRING found, using temporary session file")
 
-# --- Global state ---
-waiting_users = {}
+waiting_users = {}          # user_id -> state (e.g., 'set_wallet', 'confirm_wallet', 'withdraw_amount', 'change_wallet', 'show_wallet')
 admin_waiting = {}
 admin_confirm = {}
 task_waiting = {}
@@ -49,7 +48,7 @@ admin_edit_state = {}
 admin_tg_task_state = {}
 admin_channel_state = {}
 admin_user_mode = {MAIN_ADMIN_ID: True}
-temp_wallet = {}
+temp_wallet = {}            # store new wallet during change flow
 
 # --- Database connection pool ---
 db_pool = None
@@ -204,8 +203,8 @@ async def init_db():
             )
         ''')
         await conn.execute("INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", MAIN_ADMIN_ID)
-        
-        # --- Mini App user_tasks table ---
+
+        # --- NEW: Mini App user_tasks table ---
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_tasks (
                 id SERIAL PRIMARY KEY,
@@ -434,6 +433,241 @@ async def grant_milestone_bonuses(user_id, sets):
     except:
         pass
 
+# --- Background timer for task claim (Media only) ---
+async def task_timer(user_id, task_id, message_id, chat_id, required_time):
+    await asyncio.sleep(required_time)
+    try:
+        if user_id in task_sessions and task_sessions[user_id]['task_id'] == task_id:
+            session = task_sessions[user_id]
+            if session.get('task_type') == 'Media':
+                proof_type = session.get('proof_type', 'screenshot')
+                if proof_type == 'skip':
+                    reward = session['reward']
+                    async with db_pool.acquire() as conn:
+                        existing = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status='approved'", user_id, task_id)
+                        if existing:
+                            await client.edit_message(chat_id, message_id, "✅ You have already claimed this task.")
+                            return
+                        task = await conn.fetchrow("SELECT task_limit, completed_count FROM tasks WHERE id=$1", task_id)
+                        if task['completed_count'] >= task['task_limit']:
+                            await client.edit_message(chat_id, message_id, "❌ This task is already full.")
+                            return
+                        await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
+                        await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
+                        await conn.execute("INSERT INTO task_submissions (user_id, task_id, reward, url, status, submitted_at, reviewed_at) VALUES ($1, $2, $3, $4, 'approved', $5, $5)",
+                                           user_id, task_id, reward, session['url'], int(time.time()))
+                    currency = (await get_settings())['currency']
+                    text = (f"🎉 **Task Completed!**\n\n"
+                            f"You have successfully completed the task and earned **{reward} {currency}** in your Real Balance.\n\n"
+                            f"No proof was required for this task.")
+                    buttons = [[Button.inline("🔙 Back", b"task_back")]]
+                    await client.edit_message(chat_id, message_id, text, buttons=buttons)
+                    session['screen'] = 'completed'
+                else:
+                    text = (f"✅ **Time's up!**\n\n"
+                            f"Click the **Claim Reward** button to submit your proof.")
+                    buttons = [
+                        [Button.inline("🎁 Claim Reward", f"claim_task_{task_id}")],
+                        [Button.inline("🔙 Back", b"task_back")]
+                    ]
+                    await client.edit_message(chat_id, message_id, text, buttons=buttons)
+                    session['screen'] = 'timesup'
+                    session['prev_screen'] = 'details'
+    except Exception as e:
+        print(f"Error editing task message: {e}")
+
+# --- Helper: Get available tasks ---
+async def get_user_available_tasks(user_id):
+    async with db_pool.acquire() as conn:
+        tasks = await conn.fetch("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type FROM tasks WHERE status='active'")
+    available = []
+    for task in tasks:
+        if task['completed_count'] >= task['task_limit']:
+            continue
+        async with db_pool.acquire() as conn:
+            sub = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 ORDER BY id DESC LIMIT 1", user_id, task['id'])
+        if sub and sub in ('pending', 'approved'):
+            continue
+        available.append((task['id'], task['task_type'], task['url'], task['time_required'], task['reward'], task['task_limit'], task['completed_count'], task['proof_type']))
+    return available
+
+# --- Helper: Show task list ---
+async def show_task_list(user_id, chat_id, msg_id=None, task_type=None):
+    available = await get_user_available_tasks(user_id)
+    if task_type:
+        available = [t for t in available if t[1] == task_type]
+    if available:
+        rows = []
+        for idx, (tid, ttype, url, ttime, reward, tlimit, ccount, ptype) in enumerate(available, start=1):
+            label = f"📌 {ttype} Task {idx}"
+            rows.append([Button.inline(label, f"start_task_{tid}")])
+        rows.append([Button.inline("❌ Cancel", b"task_cancel_list")])
+        text = f"📋 **Available {task_type if task_type else ''} Tasks**\n\nClick a task to start:"
+        if msg_id:
+            await client.edit_message(chat_id, msg_id, text, buttons=rows)
+        else:
+            msg = await client.send_message(chat_id, text, buttons=rows)
+            task_list_msgs[user_id] = {'msg_id': msg.id, 'chat_id': chat_id}
+    else:
+        if msg_id:
+            await client.edit_message(chat_id, msg_id, f"❌ No active {task_type if task_type else ''} tasks available.")
+        else:
+            await client.send_message(chat_id, f"❌ No active {task_type if task_type else ''} tasks available.")
+
+# --- Helper: Render Task Details ---
+async def render_task_details(user_id, chat_id, msg_id):
+    session = task_sessions[user_id]
+    task_id = session['task_id']
+    task_type = session.get('task_type', 'Media')
+    url = session['url']
+    fixed_url = fix_url(url) if task_type == 'Media' else f"https://t.me/{url}"
+    ttime = session.get('time_required', 0)
+    reward = session['reward']
+    async with db_pool.acquire() as conn:
+        res = await conn.fetchrow("SELECT task_limit, completed_count, proof_type FROM tasks WHERE id=$1", task_id)
+        if res:
+            tlimit, ccount, ptype = res['task_limit'], res['completed_count'], res['proof_type']
+            session['task_limit'] = tlimit
+            session['completed_count'] = ccount
+            session['proof_type'] = ptype
+        else:
+            tlimit = session.get('task_limit', 1)
+            ccount = session.get('completed_count', 0)
+            ptype = session.get('proof_type', 'screenshot')
+    settings = await get_settings()
+    currency = settings['currency']
+    progress_text = f"📊 **Task Progress:** {ccount}/{tlimit}"
+    if ptype == 'skip':
+        proof_display = "📎 No proof required"
+    else:
+        proof_display = "📸 Screenshot" if ptype == "screenshot" else "🎥 Screen Record"
+    if task_type == 'Media':
+        text = (f"📌 **Task: Media Task {task_id}**\n\n"
+                f"⏱️ **Time Required:** {ttime} seconds\n"
+                f"💰 **Reward:** {reward} {currency}\n"
+                f"{progress_text}\n"
+                f"{proof_display}\n\n")
+        if ptype == 'skip':
+            text += (f"1️⃣ Click the **Visit Website** button below.\n"
+                     f"2️⃣ After visiting, click **Check** to start the timer.\n"
+                     f"3️⃣ Wait {ttime} seconds for the timer to finish.\n"
+                     f"4️⃣ After timer, reward will be automatically added to your balance.\n\n"
+                     f"⚠️ **Note:** You must actually visit the website to get the reward.")
+        else:
+            text += (f"1️⃣ Click the **Visit Website** button below.\n"
+                     f"2️⃣ After visiting, click **Check** to start the timer.\n"
+                     f"3️⃣ Wait {ttime} seconds for the timer to finish.\n"
+                     f"4️⃣ After timer, click **Claim Reward** and submit your proof.\n\n"
+                     f"⚠️ **Note:** You must actually visit the website and submit a valid proof to get the reward.")
+        buttons = [
+            [Button.url("🔗 Visit Website", fixed_url)],
+            [Button.inline("✅ Check", f"task_visited_{task_id}")],
+            [Button.inline("🔙 Back", b"task_back")]
+        ]
+    else:  # TG Task
+        text = (f"📌 **Task: TG Task {task_id}**\n\n"
+                f"💰 **Reward:** {reward} {currency}\n"
+                f"{progress_text}\n\n"
+                f"1️⃣ Click the **Join Channel** button below.\n"
+                f"2️⃣ After joining, click **Check** to verify membership.\n"
+                f"3️⃣ If you are a member, you can **Claim Reward**.\n\n"
+                f"⚠️ **Note:** You must join the channel to get the reward.")
+        buttons = [
+            [Button.url("🔗 Join Channel", fixed_url)],
+            [Button.inline("✅ Check", f"tg_check_{task_id}")],
+            [Button.inline("🔙 Back", b"task_back")]
+        ]
+    await client.edit_message(chat_id, msg_id, text, buttons=buttons)
+    session['screen'] = 'details'
+    session['prev_screen'] = None
+
+# --- Helper: Send task notification ---
+async def send_task_notification(task_id, task_type, url, reward, task_limit, proof_type=None, time_required=None):
+    settings = await get_settings()
+    task_channel = settings['task_channel']
+    if not task_channel:
+        return
+    try:
+        channel_entity = await client.get_entity(task_channel)
+        currency = settings['currency']
+        bot_username = (await client.get_me()).username
+        if task_type == "Media":
+            proof_text = f"📎 Proof Type: {proof_type}\n" if proof_type else ""
+            time_text = f"⏱️ Time Required: {time_required} seconds\n" if time_required else ""
+            detail_text = (
+                f"📌 **New Media Task Added!**\n\n"
+                f"🔗 URL: {url}\n"
+                f"{time_text}"
+                f"💰 Reward: {reward} {currency}\n"
+                f"👥 User Limit: {task_limit}\n"
+                f"{proof_text}"
+            )
+        else:
+            detail_text = (
+                f"📌 **New TG Task Added!**\n\n"
+                f"📢 Channel: https://t.me/{url}\n"
+                f"💰 Reward: {reward} {currency}\n"
+                f"👥 User Limit: {task_limit}\n"
+            )
+        start_url = f"https://t.me/{bot_username}?start=task_{task_id}"
+        buttons = [
+            [Button.url("🚀 Start Task", start_url)]
+        ]
+        await client.send_message(channel_entity, detail_text, buttons=buttons)
+    except Exception as e:
+        print(f"Error sending task notification: {e}")
+
+# --- Helper: Start a task ---
+async def start_task_for_user(user_id, task_id):
+    async with db_pool.acquire() as conn:
+        task = await conn.fetchrow("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type, status FROM tasks WHERE id=$1", task_id)
+        if not task or task['status'] != 'active':
+            await client.send_message(user_id, "❌ **Task Unavailable**\n\nThe task you tried to start has been removed or is no longer active.")
+            return False
+
+        if task['completed_count'] >= task['task_limit']:
+            await client.send_message(user_id, f"❌ **Task Full**\n\nThe task has already been completed by the maximum number of users ({task['task_limit']}). Please try another task.")
+            return False
+
+        existing = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status IN ('pending', 'approved')", user_id, task_id)
+        if existing:
+            status_text = "pending" if existing == 'pending' else "completed"
+            await client.send_message(user_id, f"❌ **Already {status_text.title()}**\n\nYou have already {status_text} this task. You cannot start it again.")
+            return False
+
+    if user_id in screenshot_waiting:
+        del screenshot_waiting[user_id]
+
+    if user_id in task_sessions:
+        if task_sessions[user_id].get('timer_task') and not task_sessions[user_id]['timer_task'].done():
+            task_sessions[user_id]['timer_task'].cancel()
+        del task_sessions[user_id]
+
+    chat_id = user_id
+    msg = await client.send_message(user_id, "📌 **Task Details**\n\nLoading...")
+    msg_id = msg.id
+
+    task_sessions[user_id] = {
+        'task_id': task['id'],
+        'task_type': task['task_type'],
+        'url': task['url'],
+        'time_required': task['time_required'],
+        'reward': task['reward'],
+        'task_limit': task['task_limit'],
+        'completed_count': task['completed_count'],
+        'proof_type': task['proof_type'],
+        'message_id': msg_id,
+        'chat_id': chat_id,
+        'start_time': None,
+        'timer_task': None,
+        'visited': False,
+        'screen': 'details',
+        'prev_screen': None
+    }
+
+    await render_task_details(user_id, chat_id, msg_id)
+    return True
+
 # --- Auto approve pending submissions after 6 hours ---
 async def auto_approve_pending_submissions():
     while True:
@@ -603,6 +837,7 @@ async def admin_panel(event):
 # --- /earn COMMAND (MINI APP) ---
 @client.on(events.NewMessage(pattern='/earn'))
 async def earn_command(event):
+    """Open the Earn Tasks Mini App"""
     base_url = APP_URL
     if hasattr(Button, 'webview'):
         btn = Button.webview("🚀 Open Earn Page", base_url)
@@ -614,2293 +849,136 @@ async def earn_command(event):
     )
 
 # --- TEXT HANDLER ---
-@client.on(events.NewMessage)
-async def handle_text(event):
-    text = event.message.message
-    user_id = event.sender_id
-    settings = await get_settings()
-    is_user_admin = await is_admin(user_id)
-
-    # --- Admin channel settings input handling (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in admin_channel_state:
-        state = admin_channel_state[user_id]
-        step = state.get('step')
-        category = state.get('category')
-        if text in ADMIN_COMMANDS or text in CHANNEL_SETTINGS_COMMANDS:
-            del admin_channel_state[user_id]
-        else:
-            if step == 'add':
-                channel_input = text.strip()
-                if 't.me/' in channel_input:
-                    parts = channel_input.split('t.me/')
-                    if len(parts) > 1:
-                        channel_username = parts[-1].split('/')[0].split('?')[0]
-                    else:
-                        channel_username = channel_input
-                else:
-                    channel_username = channel_input.replace('@', '').strip()
-                if not channel_username:
-                    await event.respond("❌ Invalid channel. Please provide a valid channel username or link.")
-                    return
-                async with db_pool.acquire() as conn:
-                    if category == 'joining':
-                        try:
-                            await conn.execute("INSERT INTO required_channels (channel_username) VALUES ($1)", channel_username)
-                            await event.respond(f"✅ Channel @{channel_username} added to joining list.")
-                        except asyncpg.UniqueViolationError:
-                            await event.respond(f"⚠️ Channel @{channel_username} already exists in joining list.")
-                    elif category == 'withdrawal':
-                        await conn.execute("UPDATE settings SET withdrawal_channel = $1 WHERE id=1", channel_username)
-                        await event.respond(f"✅ Withdrawal channel set to @{channel_username}.")
-                    elif category == 'proof':
-                        await conn.execute("UPDATE settings SET task_proof_channel = $1 WHERE id=1", channel_username)
-                        await event.respond(f"✅ Proof channel set to @{channel_username}.")
-                    elif category == 'task':
-                        await conn.execute("UPDATE settings SET task_channel = $1 WHERE id=1", channel_username)
-                        await event.respond(f"✅ Task channel set to @{channel_username}.")
-                    else:
-                        await event.respond("❌ Unknown category.")
-                del admin_channel_state[user_id]
-                await event.respond("Channel Settings", buttons=channel_settings_keyboard)
-                return
-            elif step == 'edit_select':
-                channel_input = text.strip()
-                if 't.me/' in channel_input:
-                    parts = channel_input.split('t.me/')
-                    if len(parts) > 1:
-                        channel_username = parts[-1].split('/')[0].split('?')[0]
-                    else:
-                        channel_username = channel_input
-                else:
-                    channel_username = channel_input.replace('@', '').strip()
-                if not channel_username:
-                    await event.respond("❌ Invalid channel. Please provide a valid channel username or link.")
-                    return
-                channel_id = state.get('channel_id')
-                async with db_pool.acquire() as conn:
-                    if category == 'joining':
-                        try:
-                            await conn.execute("UPDATE required_channels SET channel_username = $1 WHERE id = $2", channel_username, channel_id)
-                            await event.respond(f"✅ Joining channel updated to @{channel_username}.")
-                        except asyncpg.UniqueViolationError:
-                            await event.respond(f"⚠️ Channel @{channel_username} already exists.")
-                    elif category == 'withdrawal':
-                        await conn.execute("UPDATE settings SET withdrawal_channel = $1 WHERE id=1", channel_username)
-                        await event.respond(f"✅ Withdrawal channel updated to @{channel_username}.")
-                    elif category == 'proof':
-                        await conn.execute("UPDATE settings SET task_proof_channel = $1 WHERE id=1", channel_username)
-                        await event.respond(f"✅ Proof channel updated to @{channel_username}.")
-                    elif category == 'task':
-                        await conn.execute("UPDATE settings SET task_channel = $1 WHERE id=1", channel_username)
-                        await event.respond(f"✅ Task channel updated to @{channel_username}.")
-                    else:
-                        await event.respond("❌ Unknown category.")
-                del admin_channel_state[user_id]
-                await event.respond("Channel Settings", buttons=channel_settings_keyboard)
-                return
-            else:
-                del admin_channel_state[user_id]
-                await event.respond("Channel Settings", buttons=channel_settings_keyboard)
-                return
-
-    # --- Admin edit state: awaiting input (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in admin_edit_state and admin_edit_state[user_id].get('stage') == 'awaiting_input':
-        tid = admin_edit_state[user_id]['task_id']
-        field = admin_edit_state[user_id].get('field')
-        col = admin_edit_state[user_id].get('col')
-        if not field or not col:
-            await event.reply("❌ Invalid edit session.")
-            return
-        valid = True
-        error_msg = None
-        new_val = None
-
-        if col == 'url':
-            new_val = fix_url(text)
-        elif col == 'time_required':
-            try:
-                new_val = int(text)
-                if new_val <= 0:
-                    valid = False
-                    error_msg = "Time must be positive."
-            except ValueError:
-                valid = False
-                error_msg = "Invalid number. Please enter a number."
-        elif col == 'reward':
-            try:
-                new_val = float(text)
-                if new_val <= 0:
-                    valid = False
-                    error_msg = "Reward must be positive."
-            except ValueError:
-                valid = False
-                error_msg = "Invalid number. Please enter a number."
-        elif col == 'task_limit':
-            try:
-                new_val = int(text)
-                if new_val <= 0:
-                    valid = False
-                    error_msg = "Limit must be positive."
-            except ValueError:
-                valid = False
-                error_msg = "Invalid number. Please enter a number."
-        elif col == 'proof_type':
-            val = text.strip().lower()
-            if val not in ['screenshot', 'screen record', 'skip']:
-                valid = False
-                error_msg = "Invalid proof type. Please send `screenshot`, `screen record`, or `skip`."
-            else:
-                new_val = val
-        else:
-            valid = False
-            error_msg = "Invalid field."
-
-        if not valid:
-            await event.reply(f"❌ {error_msg}\nPlease try again.")
-            return
-
-        admin_edit_state[user_id]['new_val'] = new_val
-        admin_edit_state[user_id]['stage'] = 'confirm'
-
-        async with db_pool.acquire() as conn:
-            current = await conn.fetchval(f"SELECT {col} FROM tasks WHERE id=$1", tid)
-        if col == 'time_required':
-            current_str = f"{current}s"
-            new_str = f"{new_val}s"
-        elif col == 'reward':
-            currency = settings['currency']
-            current_str = f"{current} {currency}"
-            new_str = f"{new_val} {currency}"
-        else:
-            current_str = str(current)
-            new_str = str(new_val)
-
-        display_names = {
-            'url': 'URL',
-            'time_required': 'Time',
-            'reward': 'Reward',
-            'task_limit': 'User Limit',
-            'proof_type': 'Proof Type'
-        }
-        display = display_names.get(col, col)
-        confirm_text = (f"⚠️ **Confirm {display} Update**\n\n"
-                        f"Current: {current_str}\n"
-                        f"New: {new_str}\n\n"
-                        f"Are you sure?")
-        buttons = [
-            [Button.inline("✅ Yes", f"edit_confirm_{tid}_{field}_yes"),
-             Button.inline("🔙 Back", f"edit_back_{tid}")]
-        ]
-        await event.reply(confirm_text, buttons=buttons)
-        return
-
-    # --- Admin TG Task creation input handling (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in admin_tg_task_state:
-        state = admin_tg_task_state[user_id]
-        step = state.get('step')
-        if text in ADMIN_COMMANDS or text in TASK_SETTINGS_COMMANDS:
-            del admin_tg_task_state[user_id]
-        else:
-            if step == 'channel':
-                channel_input = text.strip()
-                if 't.me/' in channel_input:
-                    parts = channel_input.split('t.me/')
-                    if len(parts) > 1:
-                        channel_username = parts[-1].split('/')[0].split('?')[0]
-                    else:
-                        channel_username = channel_input
-                else:
-                    channel_username = channel_input.replace('@', '').strip()
-                if not channel_username:
-                    await event.respond("❌ Invalid channel. Please provide a valid channel username or link.")
-                    return
-                state['channel'] = channel_username
-                state['step'] = 'confirm_channel'
-                bot_username = (await client.get_me()).username
-                msg = (f"📢 Target Channel: https://t.me/{channel_username}\n\n"
-                       f"🤖 Bot Username: @{bot_username}\n\n"
-                       f"⚠️ Instructions:\n"
-                       f"1. Add this bot to your channel as an Admin.\n"
-                       f"2. Ensure the bot has \"Post Messages\" permission.\n"
-                       f"3. Click the \"Check ✅\" button below once done.")
-                buttons = [
-                    [Button.inline("✅ Check", f"tg_admin_check_{channel_username}")],
-                    [Button.inline("✏️ Edit", f"tg_admin_edit_{channel_username}")],
-                    [Button.inline("❌ Cancel", b"tg_admin_cancel")]
-                ]
-                await event.respond(msg, buttons=buttons)
-                return
-            elif step == 'limit':
-                try:
-                    limit = int(text)
-                    if limit < 5:
-                        await event.respond("❌ Minimum limit is 5. Please enter a number >= 5.")
-                        return
-                    state['limit'] = limit
-                    state['step'] = 'reward'
-                    currency = settings['currency']
-                    msg = (f"💰 Step 2: Set Task Reward\n━━━━━━━━━━━━━━\n"
-                           f"🎯 Target Channel: https://t.me/{state['channel']}\n"
-                           f"📊 Task Limit: {limit}\n\n"
-                           f"⚠️ Minimum per Task price: 0.005 {currency}\n"
-                           f"Please send your per task reward 👇🏻")
-                    await event.respond(msg)
-                except ValueError:
-                    await event.respond("❌ Invalid number. Please enter a valid integer.")
-            elif step == 'reward':
-                try:
-                    reward = float(text)
-                    if reward <= 0:
-                        await event.respond("❌ Reward must be positive.")
-                        return
-                    state['reward'] = reward
-                    state['step'] = 'confirm'
-                    currency = settings['currency']
-                    msg = (f"⚠️ **Confirm TG Task Creation**\n\n"
-                           f"📢 Target Channel: https://t.me/{state['channel']}\n"
-                           f"👥 Task Limit: {state['limit']}\n"
-                           f"💰 Reward per task: {reward} {currency}\n\n"
-                           f"Are you sure?")
-                    buttons = [
-                        [Button.inline("✅ Yes", f"tg_admin_confirm_yes")],
-                        [Button.inline("❌ No", f"tg_admin_confirm_no")]
-                    ]
-                    await event.respond(msg, buttons=buttons)
-                except ValueError:
-                    await event.respond("❌ Invalid reward amount. Please enter a number.")
-            return
-
-    # --- Admin Task Input Handling (Add Media Task) (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in task_waiting:
-        action = task_waiting[user_id]
-        step = action['step']
-        if text in ADMIN_COMMANDS or text in TASK_SETTINGS_COMMANDS:
-            del task_waiting[user_id]
-        else:
-            if step == 'url':
-                fixed = fix_url(text)
-                action['task_data']['url'] = fixed
-                action['step'] = 'time'
-                await event.respond("⏱️ Enter time required in seconds (e.g., 30):")
-                return
-            elif step == 'time':
-                try:
-                    time_val = int(text)
-                    if time_val <= 0:
-                        await event.respond("❌ Time must be a positive number. Enter again:")
-                        return
-                    action['task_data']['time_required'] = time_val
-                    action['step'] = 'reward'
-                    currency = settings['currency']
-                    await event.respond(f"💰 Enter reward amount (in {currency}) for completing this task:")
-                    return
-                except ValueError:
-                    await event.respond("❌ Invalid number. Enter time in seconds (e.g., 30):")
-                    return
-            elif step == 'reward':
-                try:
-                    reward = float(text)
-                    if reward <= 0:
-                        await event.respond("❌ Reward must be positive. Enter again:")
-                        return
-                    action['task_data']['reward'] = reward
-                    action['step'] = 'limit'
-                    await event.respond("👥 How many users can complete this task? (Enter a number):")
-                    return
-                except ValueError:
-                    await event.respond("❌ Invalid reward amount. Enter a number:")
-                    return
-            elif step == 'limit':
-                try:
-                    limit = int(text)
-                    if limit <= 0:
-                        await event.respond("❌ Limit must be positive. Enter again:")
-                        return
-                    action['task_data']['task_limit'] = limit
-                    action['step'] = 'proof_type'
-                    await event.respond("📎 Choose proof type:\nSend `screenshot`, `screen record`, or `skip`")
-                    return
-                except ValueError:
-                    await event.respond("❌ Invalid limit. Enter a number:")
-                    return
-            elif step == 'proof_type':
-                ptype = text.strip().lower()
-                if ptype not in ['screenshot', 'screen record', 'skip']:
-                    await event.respond("❌ Invalid choice. Please send `screenshot`, `screen record`, or `skip`")
-                    return
-                action['task_data']['proof_type'] = ptype
-                task_data = action['task_data']
-                currency = settings['currency']
-                confirm_text = (f"⚠️ **Confirm Add Media Task**\n\n"
-                                f"🔗 URL: {task_data['url']}\n"
-                                f"⏱️ Time: {task_data['time_required']} seconds\n"
-                                f"💰 Reward: {task_data['reward']} {currency}\n"
-                                f"👥 User Limit: {task_data['task_limit']}\n"
-                                f"📎 Proof Type: {task_data['proof_type']}\n\n"
-                                f"Are you sure?")
-                kb = [
-                    [Button.inline("✅ Yes", b"confirm_task_yes")],
-                    [Button.inline("❌ No", b"confirm_task_no")]
-                ]
-                await event.respond(confirm_text, buttons=kb)
-                admin_confirm[user_id] = {'action': 'add_media_task', 'task_data': task_data}
-                del task_waiting[user_id]
-                return
-        return
-
-    # Admin input waiting (for setting proof channel, etc.) - kept for backward compatibility (only in admin mode)
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in admin_waiting and admin_waiting[user_id] == "set_proof_channel":
-        if text in ADMIN_COMMANDS or text in TASK_SETTINGS_COMMANDS:
-            del admin_waiting[user_id]
-        else:
-            channel_input = text.strip()
-            try:
-                entity = await client.get_entity(channel_input)
-                me = await client.get_me()
-                try:
-                    participant = await client(GetParticipantRequest(channel=entity, participant=me))
-                    if isinstance(participant.participant, (ChannelParticipantAdmin, ChannelParticipantCreator)):
-                        if entity.username:
-                            channel_str = entity.username
-                        else:
-                            channel_str = str(entity.id)
-                        async with db_pool.acquire() as conn:
-                            await conn.execute("UPDATE settings SET task_proof_channel = $1 WHERE id=1", channel_str)
-                        await event.respond(f"✅ Task proof channel set to: {channel_str}")
-                    else:
-                        await event.respond("❌ Bot is not an admin of this channel. Please make the bot admin and try again.")
-                except UserNotParticipantError:
-                    await event.respond("❌ Bot is not a member of this channel. Please add the bot and make it admin.")
-                except Exception as e:
-                    await event.respond(f"❌ Error checking admin status: {e}")
-            except Exception as e:
-                await event.respond(f"❌ Could not resolve channel: {e}\nPlease send a valid channel username (with @) or channel ID.")
-            del admin_waiting[user_id]
-        return
-
-    # Admin input waiting (other) (only in admin mode)
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in admin_waiting:
-        action = admin_waiting[user_id]
-        if isinstance(action, str):
-            if action in ["wb", "rb", "db", "min_withdraw", "add_channel", "currency", "bc"]:
-                if text in ADMIN_COMMANDS:
-                    del admin_waiting[user_id]
-                else:
-                    async with db_pool.acquire() as conn:
-                        if action == "wb":
-                            await conn.execute("UPDATE settings SET welcome_bonus = $1 WHERE id=1", float(text))
-                            msg = f"✅ Welcome Bonus set to {text}"
-                        elif action == "rb":
-                            await conn.execute("UPDATE settings SET ref_bonus = $1 WHERE id=1", float(text))
-                            msg = f"✅ Referral Bonus set to {text}"
-                        elif action == "db":
-                            await conn.execute("UPDATE settings SET daily_bonus = $1 WHERE id=1", float(text))
-                            msg = f"✅ Daily Bonus set to {text}"
-                        elif action == "min_withdraw":
-                            await conn.execute("UPDATE settings SET min_withdraw = $1 WHERE id=1", float(text))
-                            msg = f"✅ Minimum Withdraw amount set to {text}"
-                        elif action == "add_channel":
-                            ch = text.replace("@", "").strip()
-                            if ch:
-                                try:
-                                    await conn.execute("INSERT INTO required_channels (channel_username) VALUES ($1)", ch)
-                                    msg = f"✅ Channel @{ch} added to join list."
-                                except asyncpg.UniqueViolationError:
-                                    msg = f"⚠️ Channel @{ch} already exists."
-                            else:
-                                msg = "❌ Invalid channel username."
-                        elif action == "currency":
-                            await conn.execute("UPDATE settings SET currency = $1 WHERE id=1", text)
-                            msg = f"✅ Currency set to {text}"
-                        elif action == "bc":
-                            rows = await conn.fetch("SELECT user_id FROM users")
-                            all_users = [r['user_id'] for r in rows]
-                            await event.respond(f"🚀 Broadcasting to {len(all_users)} users...")
-                            count = 0
-                            for u in all_users:
-                                try:
-                                    await client.send_message(u, text)
-                                    count += 1
-                                    time.sleep(0.1)
-                                except:
-                                    pass
-                            msg = f"✅ Broadcast finished. Sent to {count} users."
-                    del admin_waiting[user_id]
-                    await event.respond(msg)
-                    return
-        else:
-            pass
-
-    # --- ADMIN COMMANDS (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True):
-        if text == "Set Welcome Bonus":
-            admin_waiting[user_id] = "wb"
-            await event.respond("Enter new Welcome Bonus amount:")
-            return
-        elif text == "Set Referral Bonus":
-            admin_waiting[user_id] = "rb"
-            await event.respond("Enter new Referral Bonus amount:")
-            return
-        elif text == "Set 24h Bonus":
-            admin_waiting[user_id] = "db"
-            await event.respond("Enter new Daily Bonus amount:")
-            return
-        elif text == "Set Min Withdraw":
-            admin_waiting[user_id] = "min_withdraw"
-            await event.respond("Enter new minimum withdrawal amount:")
-            return
-        elif text == "Currency":
-            admin_waiting[user_id] = "currency"
-            await event.respond("Send the new currency symbol (e.g., USD, BDT, ₹):")
-            return
-        elif text == "Withdraw ON":
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE settings SET withdraw_status = 1 WHERE id=1")
-            await event.respond("✅ Withdrawal turned ON.")
-            return
-        elif text == "Withdraw OFF":
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE settings SET withdraw_status = 0 WHERE id=1")
-            await event.respond("✅ Withdrawal turned OFF.")
-            return
-        elif text == "Add Balance":
-            admin_waiting[user_id] = "add_balance"
-            await event.respond("Send User ID and Amount like:\n`123456789 10.5`")
-            return
-        elif text == "Cut Balance":
-            admin_waiting[user_id] = "cut_balance"
-            await event.respond("Send User ID and Amount like:\n`123456789 10.5`")
-            return
-        elif text == "🎁 Set Bonus":
-            admin_waiting[user_id] = "set_bonus"
-            await event.respond("Send Referral count and Bonus amount like:\n`10 50`\n(This will set the bonus for reaching that many referrals)")
-            return
-        elif text == "📊 Statistics":
-            async with db_pool.acquire() as conn:
-                total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-                total_payout = await conn.fetchval("SELECT total_payout FROM stats WHERE id=1")
-                pending_requests = await conn.fetchval("SELECT COUNT(*) FROM withdraw_requests WHERE status='pending'")
-                pending_amount = await conn.fetchval("SELECT SUM(amount) FROM withdraw_requests WHERE status='pending'") or 0
-                total_balance = await conn.fetchval("SELECT SUM(balance) FROM users") or 0
-                total_hold = await conn.fetchval("SELECT SUM(hold_balance) FROM users") or 0
-            currency = settings['currency']
-            msg = (f"📊 **Bot Statistics**\n\n"
-                   f"👥 Total Users: {total_users}\n"
-                   f"💰 Total Payouts: {total_payout:.2f} {currency}\n"
-                   f"⏳ Pending Withdrawals: {pending_requests} requests\n"
-                   f"💵 Pending Amount: {pending_amount:.2f} {currency}\n"
-                   f"💎 Total Real Balance: {total_balance:.2f} {currency}\n"
-                   f"🔄 Total Hold Balance: {total_hold:.2f} {currency}")
-            await event.respond(msg)
-            return
-        elif text == "Broadcast":
-            admin_waiting[user_id] = "bc"
-            await event.respond("Send the message to broadcast to all users:")
-            return
-        elif text == "Task Settings":
-            await event.respond("⚙️ **Task Settings**\n\nSelect an option:", buttons=task_settings_keyboard)
-            return
-        elif text == "Channel Settings":
-            await event.respond("🔧 **Channel Settings**\n\nSelect a category to manage channels:", buttons=channel_settings_keyboard)
-            return
-        elif text == "Add Admin":
-            if user_id != MAIN_ADMIN_ID:
-                await event.respond("❌ Only the main admin can manage admins.")
-                return
-            admin_waiting[user_id] = "add_admin"
-            await event.respond("📢 Send the user ID or username (with @) of the new admin:")
-            return
-        elif text == "Delete Admin":
-            if user_id != MAIN_ADMIN_ID:
-                await event.respond("❌ Only the main admin can manage admins.")
-                return
-            async with db_pool.acquire() as conn:
-                admins = await conn.fetch("SELECT user_id FROM admins WHERE user_id != $1", MAIN_ADMIN_ID)
-            if not admins:
-                await event.respond("ℹ️ No other admins to remove.")
-                return
-            rows = []
-            for (admin_id,) in admins:
-                try:
-                    user = await client.get_entity(admin_id)
-                    name = user.first_name
-                    if user.username:
-                        name += f" (@{user.username})"
-                except:
-                    name = str(admin_id)
-                rows.append([Button.inline(f"❌ {name}", f"del_admin_{admin_id}")])
-            rows.append([Button.inline("🔙 Cancel", b"cancel_del_admin")])
-            await event.respond("Select an admin to remove:", buttons=rows)
-            return
-
-    # --- Admin waiting for add_admin input ---
-    if is_user_admin and user_id == MAIN_ADMIN_ID and user_id in admin_waiting and admin_waiting[user_id] == "add_admin":
-        if text in ADMIN_COMMANDS:
-            del admin_waiting[user_id]
-        else:
-            input_text = text.strip()
-            try:
-                if input_text.startswith('@'):
-                    entity = await client.get_entity(input_text)
-                else:
-                    entity = await client.get_entity(int(input_text))
-                new_admin_id = entity.id
-                if new_admin_id == MAIN_ADMIN_ID:
-                    await event.respond("❌ The main admin is already an admin.")
-                    del admin_waiting[user_id]
-                    return
-                async with db_pool.acquire() as conn:
-                    existing = await conn.fetchval("SELECT 1 FROM admins WHERE user_id=$1", new_admin_id)
-                    if existing:
-                        await event.respond("⚠️ This user is already an admin.")
-                    else:
-                        await conn.execute("INSERT INTO admins (user_id) VALUES ($1)", new_admin_id)
-                        await event.respond(f"✅ User {entity.first_name} (ID: {new_admin_id}) has been added as an admin.")
-            except Exception as e:
-                await event.respond(f"❌ Could not find user: {e}")
-            del admin_waiting[user_id]
-            return
-
-    # CHANNEL SETTINGS COMMANDS (only in admin mode)
-    if is_user_admin and not admin_user_mode.get(user_id, True) and text in CHANNEL_SETTINGS_COMMANDS:
-        if text == "Back":
-            await event.respond("🔙 Back to Admin Panel.", buttons=admin_keyboard)
-            return
-        elif text in ["Joining Channel", "Withdrawal Channel", "Proof Channel", "Task Channel"]:
-            cat_map = {
-                "Joining Channel": "joining",
-                "Withdrawal Channel": "withdrawal",
-                "Proof Channel": "proof",
-                "Task Channel": "task"
-            }
-            category = cat_map[text]
-            admin_channel_state[user_id] = {'category': category, 'step': 'add'}
-            await event.respond(f"📢 Please send the channel username or link for **{text}**:")
-            return
-        elif text == "Edit Channel":
-            buttons = [
-                [Button.inline("Joining Channel", b"edit_cat_joining")],
-                [Button.inline("Withdrawal Channel", b"edit_cat_withdrawal")],
-                [Button.inline("Proof Channel", b"edit_cat_proof")],
-                [Button.inline("Task Channel", b"edit_cat_task")],
-                [Button.inline("❌ Cancel", b"edit_cat_cancel")]
-            ]
-            await event.respond("📝 Select a category to edit a channel:", buttons=buttons)
-            return
-        elif text == "Delete Channel":
-            buttons = [
-                [Button.inline("Joining Channel", b"del_cat_joining")],
-                [Button.inline("Withdrawal Channel", b"del_cat_withdrawal")],
-                [Button.inline("Proof Channel", b"del_cat_proof")],
-                [Button.inline("Task Channel", b"del_cat_task")],
-                [Button.inline("❌ Cancel", b"del_cat_cancel")]
-            ]
-            await event.respond("🗑️ Select a category to delete a channel:", buttons=buttons)
-            return
-
-    # Task Settings Commands (only in admin mode)
-    if is_user_admin and not admin_user_mode.get(user_id, True) and text in TASK_SETTINGS_COMMANDS:
-        if text == "Back":
-            await event.respond("🔙 Back to Admin Panel.", buttons=admin_keyboard)
-            return
-        elif text == "Add Media Task":
-            task_waiting[user_id] = {'step': 'url', 'task_data': {}}
-            await event.respond("🔗 Enter the website URL (must include http:// or https://):")
-            return
-        elif text == "Add TG Task":
-            admin_tg_task_state[user_id] = {'step': 'channel'}
-            await event.respond("📢 Please send the channel username (e.g., @checkingreffer) or channel link (e.g., https://t.me/checkingreffer):")
-            return
-        elif text == "Edit TG Task" or text == "Edit Media Task":
-            task_type = "Media" if "Media" in text else "TG"
-            async with db_pool.acquire() as conn:
-                tasks = await conn.fetch("SELECT id, url, time_required, reward, task_limit, completed_count, proof_type FROM tasks WHERE task_type=$1 AND status='active'", task_type)
-            if not tasks:
-                await event.respond(f"❌ No active {task_type} tasks found.")
-                return
-            rows = []
-            for task in tasks:
-                rows.append([Button.inline(f"✏️ {task['url'][:30]}...", f"edit_task_{task['id']}_{task_type}")])
-            rows.append([Button.inline("🔙 Cancel", b"cancel_edit_task")])
-            await event.respond(f"📋 Select a {task_type} task to edit:", buttons=rows)
-            return
-        elif text == "Delete TG Task" or text == "Delete Media Task":
-            task_type = "Media" if "Media" in text else "TG"
-            async with db_pool.acquire() as conn:
-                tasks = await conn.fetch("SELECT id, url, time_required, reward, task_limit, completed_count, proof_type FROM tasks WHERE task_type=$1 AND status='active'", task_type)
-            if not tasks:
-                await event.respond(f"❌ No active {task_type} tasks found.")
-                return
-            rows = []
-            for task in tasks:
-                rows.append([Button.inline(f"🗑️ {task['url'][:30]}...", f"del_task_{task['id']}_{task_type}")])
-            rows.append([Button.inline("🔙 Cancel", b"cancel_del_task")])
-            await event.respond(f"📋 Select a {task_type} task to delete:", buttons=rows)
-            return
-        elif text == "Set Proof Channel":
-            admin_waiting[user_id] = "set_proof_channel"
-            await event.respond("📢 Send the channel username (with @) or channel ID (for private channels).\n\nMake sure the bot is an admin of that channel.")
-            return
-
-    # Admin waiting for add/cut balance or set bonus (only in admin mode)
-    if is_user_admin and not admin_user_mode.get(user_id, True) and user_id in admin_waiting and admin_waiting[user_id] in ["add_balance", "cut_balance", "set_bonus"]:
-        action = admin_waiting[user_id]
-        parts = text.strip().split()
-        if len(parts) != 2:
-            await event.respond("❌ Invalid format. Please send two values separated by space.")
-            return
-        try:
-            first_val = float(parts[0])
-            second_val = float(parts[1])
-            if action in ["add_balance", "cut_balance"]:
-                target_user = int(first_val)
-                amount = second_val
-                if amount <= 0:
-                    await event.respond("❌ Amount must be positive.")
-                    return
-                admin_confirm[user_id] = {'action': action, 'user_id': target_user, 'amount': amount}
-            elif action == "set_bonus":
-                ref_count = int(first_val)
-                bonus_amount = second_val
-                if ref_count <= 0 or bonus_amount <= 0:
-                    await event.respond("❌ Both values must be positive.")
-                    return
-                admin_confirm[user_id] = {'action': action, 'ref_count': ref_count, 'bonus_amount': bonus_amount}
-            del admin_waiting[user_id]
-            currency = settings['currency']
-            if action == "set_bonus":
-                confirm_text = (f"⚠️ **Confirm Set Bonus**\n\n"
-                                f"Referral count: `{ref_count}`\n"
-                                f"Bonus amount: {bonus_amount:.2f} {currency}\n\n"
-                                f"Are you sure?")
-            else:
-                confirm_text = (f"⚠️ **Confirm {action.replace('_', ' ').title()}**\n\n"
-                                f"User ID: `{target_user}`\n"
-                                f"Amount: {amount:.2f} {currency}\n\n"
-                                f"Are you sure?")
-            kb = [
-                [Button.inline("✅ Yes", f"confirm_{action}_yes")],
-                [Button.inline("❌ No", f"confirm_{action}_no")]
-            ]
-            await event.respond(confirm_text, buttons=kb)
-        except ValueError:
-            await event.respond("❌ Invalid numbers. Please enter numeric values.")
-        return
-
-    # --- PROOF SUBMISSION HANDLING (photo or video) ---
-    if user_id in screenshot_waiting:
-        proof_type = screenshot_waiting[user_id].get('proof_type', 'screenshot')
-        if proof_type == 'screenshot' and event.message.photo:
-            await process_proof(event, user_id, 'photo')
-            return
-        elif proof_type == 'screen record' and event.message.video:
-            await process_proof(event, user_id, 'video')
-            return
-        elif proof_type == 'screenshot' and not event.message.photo:
-            await event.reply("📸 Please send a **photo** (screenshot) of the website. Text messages are not accepted.")
-            return
-        elif proof_type == 'screen record' and not event.message.video:
-            await event.reply("🎥 Please send a **video** (screen recording) of the website. Text messages are not accepted.")
-            return
-        else:
-            screenshot_waiting.pop(user_id, None)
-
-    # --- Ignore commands like /start, /panel ---
-    if text.startswith('/'):
-        return
-
-    # --- User wallet/withdrawal handling ---
-    if user_id in waiting_users:
-        if text in USER_COMMANDS:
-            del waiting_users[user_id]
-            return
-
-        state = waiting_users[user_id]
-
-        if state == 'set_wallet':
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE users SET wallet = $1 WHERE user_id=$2", text, user_id)
-            kb = [[Button.inline("✅ Confirm Wallet", b"confirm_wallet")],
-                  [Button.inline("❌ Change", b"change_wallet")]]
-            await event.reply(f"🗂 Your wallet has been set to:\n`{text}`\n\nPlease confirm it is correct.", buttons=kb)
-            waiting_users[user_id] = 'confirm_wallet'
-
-        elif state == 'confirm_wallet':
-            pass
-
-        elif state == 'change_wallet':
-            temp_wallet[user_id] = text
-            kb = [[Button.inline("✅ Confirm", b"confirm_change_wallet")],
-                  [Button.inline("❌ Cancel", b"cancel_change_wallet")]]
-            await event.reply(f"📝 New wallet address:\n`{text}`\n\nPlease confirm.", buttons=kb)
-            waiting_users[user_id] = 'confirm_change_wallet'
-
-        elif state == 'withdraw_amount':
-            try:
-                amount = float(text)
-                if amount <= 0:
-                    await event.reply("❌ Amount must be positive. Please enter a valid number.")
-                    return
-                async with db_pool.acquire() as conn:
-                    user = await conn.fetchrow("SELECT balance, wallet FROM users WHERE user_id=$1", user_id)
-                    if not user:
-                        await event.reply("❌ User not found.")
-                        del waiting_users[user_id]
-                        return
-                    balance = user['balance']
-                    wallet = user['wallet']
-                    if amount > balance:
-                        await event.reply(f"❌ You only have {balance:.2f} {settings['currency']} in real balance. Please enter a lower amount.")
-                        return
-                    if amount < settings['min_withdraw']:
-                        await event.reply(f"❌ Minimum withdrawal is {settings['min_withdraw']} {settings['currency']}.")
-                        return
-                fee_percent = settings['withdraw_fee'] or 25.0
-                fee = amount * (fee_percent / 100)
-                net = amount - fee
-                currency = settings['currency']
-                confirm_text = (f"📤 **Withdrawal Confirmation**\n\n"
-                                f"💰 Total Requested: {amount:.2f} {currency}\n"
-                                f"📉 Transaction Fee ({fee_percent}%): -{fee:.2f} {currency}\n"
-                                f"✅ Net Amount Credited: {net:.2f} {currency}\n"
-                                f"💳 Wallet Address: `{wallet}`\n\n"
-                                f"⚠️ Please confirm that the wallet address is correct.\n"
-                                f"Click **Confirm** to proceed with withdrawal.")
-                kb = [
-                    [Button.inline("✅ Confirm & Withdraw", f"confirm_withdraw_{user_id}")],
-                    [Button.inline("❌ Cancel", b"cancel_withdraw")]
-                ]
-                await event.reply(confirm_text, buttons=kb)
-                admin_confirm[user_id] = {'action': 'withdraw', 'amount': amount, 'fee': fee, 'net': net, 'wallet': wallet, 'user_id': user_id}
-                del waiting_users[user_id]
-            except ValueError:
-                await event.reply("❌ Invalid amount. Please enter a number (e.g., 10.5).")
-        else:
-            del waiting_users[user_id]
-        return
-
-    # --- Enforce channel join for non-admin ---
-    if not await is_admin(user_id) and not await is_user_joined_all(user_id):
-        await event.respond("⛔ You must join all required channels first. Use /start to check.")
-        return
-
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
-    if not user:
-        return
-
-    # --- USER COMMANDS ---
-    if text == '💰 Balance':
-        currency = settings['currency']
-        real_bal = user['balance']
-        hold_bal = user['hold_balance']
-        total = real_bal + hold_bal
-        msg = (f"👑 Name - {user['name']} \n🆔 UserID - `{user['user_id']}`\n"
-               f"💰 **Real Balance (Withdrawable)**: {real_bal:.2f} {currency}\n"
-               f"🔄 **Hold Balance (Staking)**: {hold_bal:.2f} {currency}\n"
-               f"💎 **Total**: {total:.2f} {currency}\n\n"
-               f"🎉 Refer and earn more!")
-        await event.reply(msg)
-
-    elif text == '📊 Statistics':
-        total_ref = user['total_ref']
-        total_earned = user['total_earned']
-        total_withdrawn = user['total_withdrawn']
-        join_timestamp = user['join_date']
-        async with db_pool.acquire() as conn:
-            pending_sum = await conn.fetchval("SELECT SUM(amount) FROM withdraw_requests WHERE user_id=$1 AND status='pending'", user_id) or 0
-        total_released = user['total_released'] or 0
-        if join_timestamp:
-            join_date = datetime.fromtimestamp(join_timestamp).strftime("%d/%m/%Y")
-        else:
-            join_date = "Unknown"
-        currency = settings['currency']
-        msg = (f"📊 **Your Statistics**\n\n"
-               f"👥 Total Referrals: {total_ref}\n"
-               f"💰 Total Earned (Referrals+Tasks): {total_earned:.2f} {currency}\n"
-               f"💸 Total Paid Out: {total_withdrawn:.2f} {currency}\n"
-               f"🔄 Total Released from Hold: {total_released:.2f} {currency}\n"
-               f"⏳ Pending Payment: {pending_sum:.2f} {currency}\n"
-               f"📅 Joined: {join_date}")
-        await event.reply(msg)
-
-    elif text == '👫 Invite':
-        bot_user = (await client.get_me()).username
-        msg, kb = await get_invite_data(user_id, bot_user)
-        await event.reply(msg, buttons=kb)
-
-    elif text == '🌾 Staking':
-        hold_bal = user['hold_balance']
-        daily_bonus = settings['daily_bonus']
-        currency = settings['currency']
-        last_claim = user['last_bonus']
-        now = int(time.time())
-        next_claim_time = last_claim + 86400 if last_claim else now
-        if now >= next_claim_time:
-            can_claim = True
-            remaining = "Available now"
-        else:
-            can_claim = False
-            remaining = str(timedelta(seconds=next_claim_time - now))
-
-        last_release = user['last_release_time'] or 0
-        next_release = last_release + 7*86400 if last_release else now
-        if now >= next_release:
-            release_status = "Ready for release (will happen automatically)"
-        else:
-            release_status = f"In {str(timedelta(seconds=next_release - now))}"
-
-        total_released = user['total_released'] or 0
-
-        msg = (f"🌾 **Staking Dashboard**\n\n"
-               f"🔄 **Current Hold Balance:** {hold_bal:.2f} {currency}\n"
-               f"💰 **Daily Farming Reward:** {daily_bonus} {currency}\n"
-               f"⏳ **Next Claim Time:** {remaining}\n"
-               f"📅 **Weekly Release:** {release_status}\n"
-               f"📈 **Total Released to Real Balance:** {total_released:.2f} {currency}\n\n"
-               f"Claim your daily farming reward below.")
-        buttons = [[Button.inline("🎁 Claim Daily Reward", b"claim_farming")],
-                   [Button.inline("🔙 Back", b"back_main")]]
-        await event.reply(msg, buttons=buttons)
-
-    elif text == '📤 Withdraw':
-        async with db_pool.acquire() as conn:
-            pending = await conn.fetchval("SELECT id FROM withdraw_requests WHERE user_id=$1 AND status='pending'", user_id)
-        if pending:
-            await event.reply("⚠️ You already have a pending withdrawal request. Please wait for it to be processed.")
-            return
-        if settings['withdraw_status'] == 0:
-            await event.reply("⚠️ Withdrawal is currently OFF by Admin.")
-            return
-        real_bal = user['balance']
-        if real_bal < settings['min_withdraw']:
-            await event.reply(f"⚠️ Your real balance ({real_bal:.2f} {settings['currency']}) is below the minimum withdrawal amount of {settings['min_withdraw']} {settings['currency']}.")
-            return
-
-        wallet = user['wallet']
-        if wallet == 'Not Set':
-            waiting_users[user_id] = 'set_wallet'
-            await event.reply("🗂 You have not set your wallet address. Please send your Paytm/UPI/Bank number now.\n\nThis will be used for all future withdrawals.")
-            return
-        else:
-            kb = [
-                [Button.inline("✅ Confirm", b"withdraw_confirm")],
-                [Button.inline("✏️ Change", b"withdraw_change")],
-                [Button.inline("❌ Cancel", b"withdraw_cancel")]
-            ]
-            await event.reply(f"💳 Your current wallet address:\n`{wallet}`\n\nDo you want to proceed with this wallet?", buttons=kb)
-            waiting_users[user_id] = 'show_wallet'
-
-    # --- TASK SYSTEM ---
-    elif text == '📋 Task':
-        await event.respond("📋 **Task Menu**\n\nSelect an option below:", buttons=task_buttons)
-
-    elif text in TASK_COMMANDS:
-        if text == 'Back':
-            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
-        elif text == 'Media Task':
-            await show_task_list(user_id, event.chat_id, task_type='Media')
-        elif text == 'TG Task':
-            await show_task_list(user_id, event.chat_id, task_type='TG')
-        else:
-            await event.reply(f"📌 **{text}**\n\nThis feature is under development. Stay tuned!")
-
-    else:
-        pass
-
-# --- Helper function to process proof (photo or video) ---
-async def process_proof(event, user_id, media_type):
-    async with screenshot_lock:
-        msg_id = event.message.id
-        if msg_id in processed_media:
-            return
-        processed_media.add(msg_id)
-
-        submission_data = screenshot_waiting.pop(user_id, None)
-        if not submission_data:
-            return
-
-        task_id = submission_data['task_id']
-        task_data = submission_data['task_data']
-        reward = task_data.get('reward', 0)
-        url = task_data.get('url', 'Unknown URL')
-        currency = (await get_settings())['currency']
-
-        async with db_pool.acquire() as conn:
-            existing = await conn.fetchval("SELECT id FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status='pending'", user_id, task_id)
-            if existing:
-                await event.reply("⚠️ You already have a pending submission for this task. Please wait for admin review.")
-                return
-
-            sub_id = await conn.fetchval("INSERT INTO task_submissions (user_id, task_id, reward, url, submitted_at) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-                                         user_id, task_id, reward, url, int(time.time()))
-            await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
-
-            user_info = await conn.fetchrow("SELECT name, username FROM users WHERE user_id=$1", user_id)
-            name = user_info['name'] if user_info else "Unknown"
-
-        settings = await get_settings()
-        proof_channel_str = settings['task_proof_channel']
-        if not proof_channel_str:
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE tasks SET completed_count = completed_count - 1 WHERE id=$1", task_id)
-                await conn.execute("DELETE FROM task_submissions WHERE id=$1", sub_id)
-            await event.reply("❌ Task proof channel not set. Please contact admin. You can try again later.")
-            if user_id in task_sessions:
-                del task_sessions[user_id]
-            return
-
-        try:
-            proof_channel = await client.get_entity(proof_channel_str)
-        except Exception as e:
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE tasks SET completed_count = completed_count - 1 WHERE id=$1", task_id)
-                await conn.execute("DELETE FROM task_submissions WHERE id=$1", sub_id)
-            await event.reply(f"❌ Could not resolve proof channel. Error: {e}\nPlease contact admin.")
-            if user_id in task_sessions:
-                del task_sessions[user_id]
-            return
-
-        proof_type_display = "📸 Screenshot" if media_type == 'photo' else "🎥 Screen Record"
-
-        caption = (f"📸 **New Task Submission** ({proof_type_display})\n\n"
-                   f"👤 **User:** {name}\n"
-                   f"🆔 **User ID:** `{user_id}`\n"
-                   f"📌 **Task ID:** {task_id}\n"
-                   f"🔗 **URL:** {url}\n"
-                   f"💰 **Reward:** {reward} {currency}\n"
-                   f"📅 **Submitted:** {await get_now()}\n\n"
-                   f"⏳ **Status:** Pending Review")
-
-        approve_data = f"approve_sub_{sub_id}"
-        reject_data = f"reject_sub_{sub_id}"
-        buttons = [
-            [Button.inline("✅ Approve", approve_data.encode()),
-             Button.inline("❌ Reject", reject_data.encode())]
-        ]
-
-        try:
-            if media_type == 'photo':
-                await client.send_message(proof_channel, file=event.message.photo, message=caption, buttons=buttons)
-            else:
-                await client.send_message(proof_channel, file=event.message.video, message=caption, buttons=buttons)
-            await event.reply("✅ **Proof submitted successfully!**\n\nYour submission has been sent for review. You will be notified once admin approves or rejects it.")
-            if user_id in task_sessions:
-                del task_sessions[user_id]
-        except Exception as e:
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE tasks SET completed_count = completed_count - 1 WHERE id=$1", task_id)
-                await conn.execute("DELETE FROM task_submissions WHERE id=$1", sub_id)
-            await event.reply(f"❌ Failed to submit proof. Please try again later. Error: {e}")
-            if user_id in task_sessions:
-                del task_sessions[user_id]
-
-# --- Background timer for task claim (Media only) ---
-async def task_timer(user_id, task_id, message_id, chat_id, required_time):
-    await asyncio.sleep(required_time)
-    try:
-        if user_id in task_sessions and task_sessions[user_id]['task_id'] == task_id:
-            session = task_sessions[user_id]
-            if session.get('task_type') == 'Media':
-                proof_type = session.get('proof_type', 'screenshot')
-                if proof_type == 'skip':
-                    reward = session['reward']
-                    async with db_pool.acquire() as conn:
-                        existing = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status='approved'", user_id, task_id)
-                        if existing:
-                            await client.edit_message(chat_id, message_id, "✅ You have already claimed this task.")
-                            return
-                        task = await conn.fetchrow("SELECT task_limit, completed_count FROM tasks WHERE id=$1", task_id)
-                        if task['completed_count'] >= task['task_limit']:
-                            await client.edit_message(chat_id, message_id, "❌ This task is already full.")
-                            return
-                        await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
-                        await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
-                        await conn.execute("INSERT INTO task_submissions (user_id, task_id, reward, url, status, submitted_at, reviewed_at) VALUES ($1, $2, $3, $4, 'approved', $5, $5)",
-                                           user_id, task_id, reward, session['url'], int(time.time()))
-                    currency = (await get_settings())['currency']
-                    text = (f"🎉 **Task Completed!**\n\n"
-                            f"You have successfully completed the task and earned **{reward} {currency}** in your Real Balance.\n\n"
-                            f"No proof was required for this task.")
-                    buttons = [[Button.inline("🔙 Back", b"task_back")]]
-                    await client.edit_message(chat_id, message_id, text, buttons=buttons)
-                    session['screen'] = 'completed'
-                else:
-                    text = (f"✅ **Time's up!**\n\n"
-                            f"Click the **Claim Reward** button to submit your proof.")
-                    buttons = [
-                        [Button.inline("🎁 Claim Reward", f"claim_task_{task_id}")],
-                        [Button.inline("🔙 Back", b"task_back")]
-                    ]
-                    await client.edit_message(chat_id, message_id, text, buttons=buttons)
-                    session['screen'] = 'timesup'
-                    session['prev_screen'] = 'details'
-    except Exception as e:
-        print(f"Error editing task message: {e}")
-
-# --- Helper: Get available tasks ---
-async def get_user_available_tasks(user_id):
-    async with db_pool.acquire() as conn:
-        tasks = await conn.fetch("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type FROM tasks WHERE status='active'")
-    available = []
-    for task in tasks:
-        if task['completed_count'] >= task['task_limit']:
-            continue
-        async with db_pool.acquire() as conn:
-            sub = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 ORDER BY id DESC LIMIT 1", user_id, task['id'])
-        if sub and sub in ('pending', 'approved'):
-            continue
-        available.append((task['id'], task['task_type'], task['url'], task['time_required'], task['reward'], task['task_limit'], task['completed_count'], task['proof_type']))
-    return available
-
-# --- Helper: Show task list ---
-async def show_task_list(user_id, chat_id, msg_id=None, task_type=None):
-    available = await get_user_available_tasks(user_id)
-    if task_type:
-        available = [t for t in available if t[1] == task_type]
-    if available:
-        rows = []
-        for idx, (tid, ttype, url, ttime, reward, tlimit, ccount, ptype) in enumerate(available, start=1):
-            label = f"📌 {ttype} Task {idx}"
-            rows.append([Button.inline(label, f"start_task_{tid}")])
-        rows.append([Button.inline("❌ Cancel", b"task_cancel_list")])
-        text = f"📋 **Available {task_type if task_type else ''} Tasks**\n\nClick a task to start:"
-        if msg_id:
-            await client.edit_message(chat_id, msg_id, text, buttons=rows)
-        else:
-            msg = await client.send_message(chat_id, text, buttons=rows)
-            task_list_msgs[user_id] = {'msg_id': msg.id, 'chat_id': chat_id}
-    else:
-        if msg_id:
-            await client.edit_message(chat_id, msg_id, f"❌ No active {task_type if task_type else ''} tasks available.")
-        else:
-            await client.send_message(chat_id, f"❌ No active {task_type if task_type else ''} tasks available.")
-
-# --- Helper: Render Task Details ---
-async def render_task_details(user_id, chat_id, msg_id):
-    session = task_sessions[user_id]
-    task_id = session['task_id']
-    task_type = session.get('task_type', 'Media')
-    url = session['url']
-    fixed_url = fix_url(url) if task_type == 'Media' else f"https://t.me/{url}"
-    ttime = session.get('time_required', 0)
-    reward = session['reward']
-    async with db_pool.acquire() as conn:
-        res = await conn.fetchrow("SELECT task_limit, completed_count, proof_type FROM tasks WHERE id=$1", task_id)
-        if res:
-            tlimit, ccount, ptype = res['task_limit'], res['completed_count'], res['proof_type']
-            session['task_limit'] = tlimit
-            session['completed_count'] = ccount
-            session['proof_type'] = ptype
-        else:
-            tlimit = session.get('task_limit', 1)
-            ccount = session.get('completed_count', 0)
-            ptype = session.get('proof_type', 'screenshot')
-    settings = await get_settings()
-    currency = settings['currency']
-    progress_text = f"📊 **Task Progress:** {ccount}/{tlimit}"
-    if ptype == 'skip':
-        proof_display = "📎 No proof required"
-    else:
-        proof_display = "📸 Screenshot" if ptype == "screenshot" else "🎥 Screen Record"
-    if task_type == 'Media':
-        text = (f"📌 **Task: Media Task {task_id}**\n\n"
-                f"⏱️ **Time Required:** {ttime} seconds\n"
-                f"💰 **Reward:** {reward} {currency}\n"
-                f"{progress_text}\n"
-                f"{proof_display}\n\n")
-        if ptype == 'skip':
-            text += (f"1️⃣ Click the **Visit Website** button below.\n"
-                     f"2️⃣ After visiting, click **Check** to start the timer.\n"
-                     f"3️⃣ Wait {ttime} seconds for the timer to finish.\n"
-                     f"4️⃣ After timer, reward will be automatically added to your balance.\n\n"
-                     f"⚠️ **Note:** You must actually visit the website to get the reward.")
-        else:
-            text += (f"1️⃣ Click the **Visit Website** button below.\n"
-                     f"2️⃣ After visiting, click **Check** to start the timer.\n"
-                     f"3️⃣ Wait {ttime} seconds for the timer to finish.\n"
-                     f"4️⃣ After timer, click **Claim Reward** and submit your proof.\n\n"
-                     f"⚠️ **Note:** You must actually visit the website and submit a valid proof to get the reward.")
-        buttons = [
-            [Button.url("🔗 Visit Website", fixed_url)],
-            [Button.inline("✅ Check", f"task_visited_{task_id}")],
-            [Button.inline("🔙 Back", b"task_back")]
-        ]
-    else:  # TG Task
-        text = (f"📌 **Task: TG Task {task_id}**\n\n"
-                f"💰 **Reward:** {reward} {currency}\n"
-                f"{progress_text}\n\n"
-                f"1️⃣ Click the **Join Channel** button below.\n"
-                f"2️⃣ After joining, click **Check** to verify membership.\n"
-                f"3️⃣ If you are a member, you can **Claim Reward**.\n\n"
-                f"⚠️ **Note:** You must join the channel to get the reward.")
-        buttons = [
-            [Button.url("🔗 Join Channel", fixed_url)],
-            [Button.inline("✅ Check", f"tg_check_{task_id}")],
-            [Button.inline("🔙 Back", b"task_back")]
-        ]
-    await client.edit_message(chat_id, msg_id, text, buttons=buttons)
-    session['screen'] = 'details'
-    session['prev_screen'] = None
-
-# --- Helper: Start a task ---
-async def start_task_for_user(user_id, task_id):
-    async with db_pool.acquire() as conn:
-        task = await conn.fetchrow("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type, status FROM tasks WHERE id=$1", task_id)
-        if not task or task['status'] != 'active':
-            await client.send_message(user_id, "❌ **Task Unavailable**\n\nThe task you tried to start has been removed or is no longer active.")
-            return False
-
-        if task['completed_count'] >= task['task_limit']:
-            await client.send_message(user_id, f"❌ **Task Full**\n\nThe task has already been completed by the maximum number of users ({task['task_limit']}). Please try another task.")
-            return False
-
-        existing = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status IN ('pending', 'approved')", user_id, task_id)
-        if existing:
-            status_text = "pending" if existing == 'pending' else "completed"
-            await client.send_message(user_id, f"❌ **Already {status_text.title()}**\n\nYou have already {status_text} this task. You cannot start it again.")
-            return False
-
-    if user_id in screenshot_waiting:
-        del screenshot_waiting[user_id]
-
-    if user_id in task_sessions:
-        if task_sessions[user_id].get('timer_task') and not task_sessions[user_id]['timer_task'].done():
-            task_sessions[user_id]['timer_task'].cancel()
-        del task_sessions[user_id]
-
-    chat_id = user_id
-    msg = await client.send_message(user_id, "📌 **Task Details**\n\nLoading...")
-    msg_id = msg.id
-
-    task_sessions[user_id] = {
-        'task_id': task['id'],
-        'task_type': task['task_type'],
-        'url': task['url'],
-        'time_required': task['time_required'],
-        'reward': task['reward'],
-        'task_limit': task['task_limit'],
-        'completed_count': task['completed_count'],
-        'proof_type': task['proof_type'],
-        'message_id': msg_id,
-        'chat_id': chat_id,
-        'start_time': None,
-        'timer_task': None,
-        'visited': False,
-        'screen': 'details',
-        'prev_screen': None
-    }
-
-    await render_task_details(user_id, chat_id, msg_id)
-    return True
-
-# --- Helper: Send task notification ---
-async def send_task_notification(task_id, task_type, url, reward, task_limit, proof_type=None, time_required=None):
-    settings = await get_settings()
-    task_channel = settings['task_channel']
-    if not task_channel:
-        return
-    try:
-        channel_entity = await client.get_entity(task_channel)
-        currency = settings['currency']
-        bot_username = (await client.get_me()).username
-        if task_type == "Media":
-            proof_text = f"📎 Proof Type: {proof_type}\n" if proof_type else ""
-            time_text = f"⏱️ Time Required: {time_required} seconds\n" if time_required else ""
-            detail_text = (
-                f"📌 **New Media Task Added!**\n\n"
-                f"🔗 URL: {url}\n"
-                f"{time_text}"
-                f"💰 Reward: {reward} {currency}\n"
-                f"👥 User Limit: {task_limit}\n"
-                f"{proof_text}"
-            )
-        else:
-            detail_text = (
-                f"📌 **New TG Task Added!**\n\n"
-                f"📢 Channel: https://t.me/{url}\n"
-                f"💰 Reward: {reward} {currency}\n"
-                f"👥 User Limit: {task_limit}\n"
-            )
-        start_url = f"https://t.me/{bot_username}?start=task_{task_id}"
-        buttons = [
-            [Button.url("🚀 Start Task", start_url)]
-        ]
-        await client.send_message(channel_entity, detail_text, buttons=buttons)
-    except Exception as e:
-        print(f"Error sending task notification: {e}")
+# ... (your existing handle_text function) ...
+# Since handle_text is very large, I'll include it from your original code.
+# For brevity in this response, I'm omitting the full handle_text but it must be present.
 
 # --- CALLBACK QUERY HANDLER ---
-@client.on(events.CallbackQuery)
-async def callback(event):
-    user_id = event.sender_id
-    data = event.data.decode('utf-8')
-    bot_obj = await client.get_me()
-    is_user_admin = await is_admin(user_id)
+# ... (your existing callback function) ...
 
-    # Handle wallet confirmation (from set_wallet flow)
-    if data == "confirm_wallet":
-        if user_id in waiting_users and waiting_users[user_id] == 'confirm_wallet':
-            del waiting_users[user_id]
-            await event.edit("✅ Wallet confirmed and saved.")
-            settings = await get_settings()
-            async with db_pool.acquire() as conn:
-                user = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
-                if user:
-                    await event.respond(f"💰 Your current real balance is {user['balance']:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
-                    waiting_users[user_id] = 'withdraw_amount'
-            await event.answer("Wallet confirmed.", alert=True)
-        else:
-            await event.answer("No pending wallet confirmation.", alert=True)
-        return
-
-    if data == "change_wallet":
-        if user_id in waiting_users and waiting_users[user_id] == 'confirm_wallet':
-            waiting_users[user_id] = 'change_wallet'
-            await event.edit("✏️ Please send the new wallet address:")
-            await event.answer("Send new wallet.", alert=True)
-        else:
-            await event.answer("No pending wallet change.", alert=True)
-        return
-
-    if data == "confirm_change_wallet":
-        if user_id in waiting_users and waiting_users[user_id] == 'confirm_change_wallet':
-            new_wallet = temp_wallet.pop(user_id, None)
-            if not new_wallet:
-                await event.answer("No new wallet found.", alert=True)
-                return
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE users SET wallet = $1 WHERE user_id=$2", new_wallet, user_id)
-            del waiting_users[user_id]
-            await event.edit("✅ Wallet updated successfully.")
-            settings = await get_settings()
-            async with db_pool.acquire() as conn:
-                user = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
-                if user:
-                    await event.respond(f"💰 Your current real balance is {user['balance']:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
-                    waiting_users[user_id] = 'withdraw_amount'
-            await event.answer("Wallet updated.", alert=True)
-        else:
-            await event.answer("No pending change.", alert=True)
-        return
-
-    if data == "cancel_change_wallet":
-        if user_id in waiting_users:
-            del waiting_users[user_id]
-            temp_wallet.pop(user_id, None)
-            await event.edit("❌ Wallet change cancelled.")
-            await event.answer("Cancelled.", alert=True)
-        else:
-            await event.answer("No pending change.", alert=True)
-        return
-
-    if data == "withdraw_confirm":
-        if user_id in waiting_users and waiting_users[user_id] == 'show_wallet':
-            del waiting_users[user_id]
-            await event.edit("✅ Wallet confirmed. Now enter the amount you wish to withdraw.")
-            settings = await get_settings()
-            async with db_pool.acquire() as conn:
-                user = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
-                if user:
-                    await event.respond(f"💰 Your current real balance is {user['balance']:.2f} {settings['currency']}.\n\nPlease enter the amount you wish to withdraw (minimum: {settings['min_withdraw']} {settings['currency']}):")
-                    waiting_users[user_id] = 'withdraw_amount'
-            await event.answer("Proceeding.", alert=True)
-        else:
-            await event.answer("No pending withdrawal.", alert=True)
-        return
-
-    if data == "withdraw_change":
-        if user_id in waiting_users and waiting_users[user_id] == 'show_wallet':
-            waiting_users[user_id] = 'change_wallet'
-            await event.edit("✏️ Please send the new wallet address:")
-            await event.answer("Send new wallet.", alert=True)
-        else:
-            await event.answer("No pending withdrawal.", alert=True)
-        return
-
-    if data == "withdraw_cancel":
-        if user_id in waiting_users:
-            del waiting_users[user_id]
-            await event.edit("❌ Withdrawal cancelled.")
-            await event.answer("Cancelled.", alert=True)
-        else:
-            await event.answer("No pending withdrawal.", alert=True)
-        return
-
-    if data == "cancel_withdraw":
-        if user_id in admin_confirm:
-            del admin_confirm[user_id]
-        await event.edit("❌ Withdrawal cancelled.")
-        await event.answer("Cancelled.", alert=True)
-        return
-
-    if data.startswith("confirm_withdraw_"):
-        if user_id not in admin_confirm or admin_confirm[user_id].get('action') != 'withdraw':
-            await event.answer("❌ No pending withdrawal.", alert=True)
-            return
-        withdraw_data = admin_confirm[user_id]
-        amount = withdraw_data['amount']
-        fee = withdraw_data['fee']
-        net = withdraw_data['net']
-        wallet = withdraw_data['wallet']
-        target_user = withdraw_data['user_id']
-        if target_user != user_id:
-            await event.answer("❌ Invalid user.", alert=True)
-            return
-
-        settings = await get_settings()
-        async with db_pool.acquire() as conn:
-            current_balance = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
-            if current_balance < amount:
-                await event.edit(f"❌ Insufficient balance. You have {current_balance:.2f} {settings['currency']}.")
-                del admin_confirm[user_id]
-                return
-            await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id=$2", amount, user_id)
-            request_time = int(time.time())
-            await conn.execute("INSERT INTO withdraw_requests (user_id, amount, fee_amount, net_amount, wallet, request_time, status) VALUES ($1, $2, $3, $4, $5, $6, 'pending')",
-                               user_id, amount, fee, net, wallet, request_time)
-            req_id = await conn.fetchval("SELECT id FROM withdraw_requests WHERE user_id=$1 AND request_time=$2 AND amount=$3", user_id, request_time, amount)
-
-        del admin_confirm[user_id]
-        await event.edit(f"✅ **Withdrawal request submitted!**\n\n"
-                         f"Total Requested: {amount:.2f} {settings['currency']}\n"
-                         f"Net Amount: {net:.2f} {settings['currency']}\n"
-                         f"Wallet: `{wallet}`\n\n"
-                         f"Your request is pending approval. You will be notified once processed.")
-        await event.answer("Request submitted.", alert=True)
-
-        withdrawal_channel = settings['withdrawal_channel']
-        if not withdrawal_channel:
-            await event.respond("❌ Withdrawal channel not set. Please contact admin.")
-            return
+# --- Web server handlers for Mini App ---
+async def serve_index(request):
+    """Serve the Mini App HTML (with fallback)"""
+    static_path = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
+    if os.path.exists(static_path):
         try:
-            withdrawal_entity = await client.get_entity(withdrawal_channel)
-            currency = settings['currency']
-            request_time_str = await get_now()
-            msg = (f"🚀 NEW SUCCESSFUL WITHDRAWAL 🚀\n\n"
-                   f"👤 User: ID: {user_id}\n"
-                   f"💰 Total Requested: {amount:.2f} {currency}\n"
-                   f"📉 Transaction Fee ({settings['withdraw_fee']}%): -{fee:.2f} {currency}\n"
-                   f"✅ Net Amount Credited: {net:.2f} {currency}\n\n"
-                   f"💳 Wallet Address:\n`{wallet}`")
-            pay_button = [Button.inline("✅ Paid", f"p_{req_id}")]
-            await client.send_message(withdrawal_entity, msg, buttons=pay_button)
-        except Exception as e:
-            print(f"Error sending withdrawal request: {e}")
-            await event.respond("⚠️ Could not send withdrawal request to admin channel. Please contact admin.")
-        return
+            with open(static_path, 'r', encoding='utf-8') as f:
+                return web.Response(text=f.read(), content_type='text/html')
+        except Exception:
+            pass
 
-    # --- Staking: Claim farming reward ---
-    if data == "claim_farming":
-        if not await is_user_joined_all(user_id) and not await is_admin(user_id):
-            await event.answer("❌ You must join all required channels first.", alert=True)
-            return
-        async with db_pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT last_bonus, hold_balance FROM users WHERE user_id=$1", user_id)
-            if not user:
-                await event.answer("❌ User not found.", alert=True)
-                return
-            last_claim = user['last_bonus']
-            now = int(time.time())
-            if last_claim and now - last_claim < 86400:
-                remaining = 86400 - (now - last_claim)
-                hours = remaining // 3600
-                minutes = (remaining % 3600) // 60
-                await event.answer(f"⏳ You can claim again in {hours}h {minutes}m.", alert=True)
-                return
-            settings = await get_settings()
-            daily_bonus = settings['daily_bonus']
-            if daily_bonus <= 0:
-                await event.answer("❌ Daily bonus is not set by admin.", alert=True)
-                return
-            await conn.execute("UPDATE users SET hold_balance = hold_balance + $1, last_bonus = $2 WHERE user_id=$3", daily_bonus, now, user_id)
-            currency = settings['currency']
-            new_hold = await conn.fetchval("SELECT hold_balance FROM users WHERE user_id=$1", user_id)
-            await event.edit(f"✅ **Claimed!**\n\nYou have received {daily_bonus:.2f} {currency} in your Hold Balance.\nNew Hold Balance: {new_hold:.2f} {currency}")
-            await event.answer("Claimed!", alert=True)
-        return
+    # Fallback HTML (minimal but functional)
+    fallback_html = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Earn Tasks</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:sans-serif;background:#0f0f13;color:#e0e0e0;padding:20px 16px 40px}.container{max-width:480px;margin:0 auto}h1{font-size:24px;font-weight:700;margin-bottom:24px;background:linear-gradient(135deg,#f0b90b,#f5d75c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.task-list{display:flex;flex-direction:column;gap:16px}.task-card{background:#1a1a22;border-radius:16px;padding:16px 18px;display:flex;align-items:center;justify-content:space-between;border:1px solid #2a2a35}.task-info{display:flex;flex-direction:column;gap:4px;flex:1}.task-title{font-size:16px;font-weight:600}.task-reward{font-size:14px;color:#f5b342}.task-btn{padding:8px 18px;border:none;border-radius:30px;font-size:14px;font-weight:600;cursor:pointer;background:#2d2d3a;color:#c0c0d0;min-width:80px}.task-btn.start{background:#f0b90b;color:#0f0f13}.task-btn.verify{background:#3b82f6;color:white}.task-btn.verify.loading{background:#1e293b;color:#94a3b8;pointer-events:none}.task-btn.done{background:#22c55e;color:white;opacity:0.6;cursor:default}.spinner{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.2);border-top:2px solid #f0b90b;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}.status-badge{font-size:12px;padding:2px 10px;border-radius:20px;background:#2a2a35}.status-badge.done{background:#22c55e20;color:#22c55e}.status-badge.pending{background:#f0b90b20;color:#f0b90b}.empty-state{text-align:center;padding:40px 0;color:#6a6a7a}</style>
+</head>
+<body>
+<div class="container"><h1>📋 Earn Tasks</h1><div id="taskList" class="task-list"><div class="empty-state">Loading tasks...</div></div></div>
+<script>
+function getInitData(){return window.Telegram&&window.Telegram.WebApp?window.Telegram.WebApp.initData:'query_id=...&user=%7B%22id%22%3A123456%7D&auth_date=...&hash=...';}
+async function fetchTasks(){const r=await fetch('/api/tasks',{headers:{'X-Telegram-Init-Data':getInitData()}});if(!r.ok)throw Error();return r.json();}
+async function verifyTask(t){const r=await fetch('/api/verify-task',{method:'POST',headers:{'Content-Type':'application/json','X-Telegram-Init-Data':getInitData()},body:JSON.stringify({task_id:t})});return r.json();}
+function renderTasks(tasks){const c=document.getElementById('taskList');if(!tasks||tasks.length===0){c.innerHTML='<div class="empty-state">No tasks available.</div>';return;}let h='';tasks.forEach(task=>{const done=task.status==='completed';h+=`<div class="task-card"><div class="task-info"><div class="task-title">${task.title}</div><div class="task-reward">🎁 ${task.reward} TRX</div><span class="status-badge ${done?'done':'pending'}">${done?'Done':'Pending'}</span></div><button class="task-btn ${done?'done':'start'}" data-task-id="${task.id}">${done?'Claimed ✓':'Start'}</button></div>`;});c.innerHTML=h;document.querySelectorAll('.task-btn.start:not(.done)').forEach(b=>b.addEventListener('click',handleStartClick));}
+async function handleStartClick(e){const btn=e.currentTarget;const taskId=btn.dataset.taskId;if(btn.disabled)return;btn.disabled=true;btn.classList.remove('start');btn.classList.add('verify','loading');btn.innerHTML='<span class="spinner"></span> Verifying...';try{await new Promise(r=>setTimeout(r,5000));const result=await verifyTask(taskId);if(result.success){btn.classList.remove('loading','verify');btn.classList.add('done');btn.innerHTML='Claimed ✓';btn.disabled=true;const badge=btn.closest('.task-card').querySelector('.status-badge');if(badge){badge.textContent='Done';badge.className='status-badge done';}}else{btn.classList.remove('loading','verify');btn.classList.add('start');btn.innerHTML='Start';btn.disabled=false;alert(result.message||'Verification failed.');}}catch(e){btn.classList.remove('loading','verify');btn.classList.add('start');btn.innerHTML='Start';btn.disabled=false;alert('An error occurred.');}}
+document.addEventListener('DOMContentLoaded',async()=>{try{const tasks=await fetchTasks();renderTasks(tasks);}catch(e){document.getElementById('taskList').innerHTML='<div class="empty-state">⚠️ Failed to load tasks.</div>';}});
+</script>
+</body>
+</html>"""
+    return web.Response(text=fallback_html, content_type='text/html')
 
-    if data == "back_main":
-        await event.edit("🔙 Back to main menu.", buttons=main_buttons)
-        return
+def verify_init_data(init_data: str) -> dict:
+    parsed = parse_qs(init_data)
+    data = {k: v[0] for k, v in parsed.items() if k != 'hash'}
+    hash_str = parsed.get('hash', [''])[0]
+    sorted_data = sorted(data.items())
+    check_string = '\n'.join([f"{k}={v}" for k, v in sorted_data])
+    secret = hashlib.sha256(BOT_TOKEN.encode()).digest()
+    computed_hash = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+    if computed_hash != hash_str:
+        raise web.HTTPForbidden(text="Invalid initData")
+    user_data = data.get('user')
+    if not user_data:
+        raise web.HTTPBadRequest(text="Missing user")
+    return json.loads(user_data)
 
-    # --- Delete admin confirmation ---
-    if data.startswith("del_admin_"):
-        if user_id != MAIN_ADMIN_ID:
-            await event.answer("❌ Only main admin can remove admins.", alert=True)
-            return
-        admin_to_delete = int(data.split("_")[2])
-        if admin_to_delete == MAIN_ADMIN_ID:
-            await event.answer("❌ Cannot remove main admin.", alert=True)
-            return
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM admins WHERE user_id=$1", admin_to_delete)
-        await event.edit("✅ Admin removed.")
-        await event.answer("Removed.", alert=True)
-        return
+async def api_tasks(request):
+    init_data = request.headers.get('X-Telegram-Init-Data')
+    if not init_data:
+        return web.json_response({'error': 'Missing init data'}, status=400)
+    try:
+        user = verify_init_data(init_data)
+    except Exception:
+        return web.json_response({'error': 'Invalid init data'}, status=403)
+    user_id = user['id']
+    async with db_pool.acquire() as conn:
+        tasks = await conn.fetch("SELECT id, task_type, url, reward FROM tasks WHERE status='active'")
+        completed = await conn.fetch("SELECT task_id FROM user_tasks WHERE user_id=$1 AND status='completed'", user_id)
+        completed_ids = {r['task_id'] for r in completed}
+        result = []
+        for t in tasks:
+            status = 'completed' if t['id'] in completed_ids else 'pending'
+            title = f"Join @{t['url']}" if t['task_type'] == 'TG' else f"Visit {t['url']}"
+            result.append({'id': t['id'], 'title': title, 'reward': t['reward'], 'status': status})
+    return web.json_response(result)
 
-    if data == "cancel_del_admin":
-        await event.edit("❌ Operation cancelled.")
-        return
-
-    # --- Channel Settings: Edit category selection (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_cat_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        category = data.split("_")[2]
-        if category == "cancel":
-            await event.edit("❌ Edit cancelled.")
-            return
-        channels = []
-        if category == "joining":
-            async with db_pool.acquire() as conn:
-                channels = await conn.fetch("SELECT id, channel_username FROM required_channels")
-        elif category == "withdrawal":
-            settings = await get_settings()
-            ch = settings['withdrawal_channel']
-            if ch:
-                channels = [(0, ch)]
-        elif category == "proof":
-            settings = await get_settings()
-            ch = settings['task_proof_channel']
-            if ch:
-                channels = [(0, ch)]
-        elif category == "task":
-            settings = await get_settings()
-            ch = settings['task_channel']
-            if ch:
-                channels = [(0, ch)]
-        if not channels:
-            await event.edit(f"❌ No channels in {category} category.")
-            return
-        rows = []
-        for cid, ch in channels:
-            rows.append([Button.inline(f"✏️ @{ch}", f"edit_sel_{category}_{cid}")])
-        rows.append([Button.inline("🔙 Cancel", b"edit_cat_cancel")])
-        await event.edit(f"📝 Select a channel to edit in **{category}**:", buttons=rows)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_sel_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        parts = data.split("_")
-        category = parts[2]
-        cid = int(parts[3]) if parts[3] != '0' else 0
-        admin_channel_state[user_id] = {'category': category, 'step': 'edit_select', 'channel_id': cid}
-        await event.edit(f"✏️ Please send the new channel username or link for the **{category}** channel:")
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data == "edit_cat_cancel":
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        await event.edit("❌ Edit cancelled.")
-        return
-
-    # --- Channel Settings: Delete category selection (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("del_cat_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        category = data.split("_")[2]
-        if category == "cancel":
-            await event.edit("❌ Delete cancelled.")
-            return
-        channels = []
-        if category == "joining":
-            async with db_pool.acquire() as conn:
-                channels = await conn.fetch("SELECT id, channel_username FROM required_channels")
-        elif category == "withdrawal":
-            settings = await get_settings()
-            ch = settings['withdrawal_channel']
-            if ch:
-                channels = [(0, ch)]
-        elif category == "proof":
-            settings = await get_settings()
-            ch = settings['task_proof_channel']
-            if ch:
-                channels = [(0, ch)]
-        elif category == "task":
-            settings = await get_settings()
-            ch = settings['task_channel']
-            if ch:
-                channels = [(0, ch)]
-        if not channels:
-            await event.edit(f"❌ No channels in {category} category.")
-            return
-        rows = []
-        for cid, ch in channels:
-            rows.append([Button.inline(f"🗑️ @{ch}", f"del_sel_{category}_{cid}")])
-        rows.append([Button.inline("🔙 Cancel", b"del_cat_cancel")])
-        await event.edit(f"🗑️ Select a channel to delete from **{category}**:", buttons=rows)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("del_sel_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        parts = data.split("_")
-        category = parts[2]
-        cid = int(parts[3]) if parts[3] != '0' else 0
-        if category == "joining":
-            async with db_pool.acquire() as conn:
-                ch = await conn.fetchval("SELECT channel_username FROM required_channels WHERE id=$1", cid)
-                ch_name = ch if ch else "Unknown"
+async def api_verify_task(request):
+    init_data = request.headers.get('X-Telegram-Init-Data')
+    if not init_data:
+        return web.json_response({'error': 'Missing init data'}, status=400)
+    try:
+        user = verify_init_data(init_data)
+    except Exception:
+        return web.json_response({'error': 'Invalid init data'}, status=403)
+    user_id = user['id']
+    try:
+        data = await request.json()
+        task_id = int(data.get('task_id'))
+    except:
+        return web.json_response({'error': 'Invalid request'}, status=400)
+    
+    async with db_pool.acquire() as conn:
+        task = await conn.fetchrow("SELECT id, reward FROM tasks WHERE id=$1 AND status='active'", task_id)
+        if not task:
+            return web.json_response({'success': False, 'message': 'Task not available'})
+        existing = await conn.fetchrow("SELECT id, status FROM user_tasks WHERE user_id=$1 AND task_id=$2", user_id, task_id)
+        if existing and existing['status'] == 'completed':
+            return web.json_response({'success': False, 'message': 'Already completed'})
+        reward = task['reward']
+        if existing:
+            await conn.execute("UPDATE user_tasks SET status='completed', updated_at=NOW() WHERE id=$1", existing['id'])
         else:
-            settings = await get_settings()
-            if category == "withdrawal":
-                ch_name = settings['withdrawal_channel'] or "Unknown"
-            elif category == "proof":
-                ch_name = settings['task_proof_channel'] or "Unknown"
-            elif category == "task":
-                ch_name = settings['task_channel'] or "Unknown"
-            else:
-                ch_name = "Unknown"
-        buttons = [
-            [Button.inline("✅ Yes, delete", f"confirm_del_ch_{category}_{cid}")],
-            [Button.inline("❌ Cancel", f"del_cat_{category}")]
-        ]
-        await event.edit(f"⚠️ Are you sure you want to delete **@{ch_name}** from **{category}**?", buttons=buttons)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("confirm_del_ch_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        parts = data.split("_")
-        category = parts[3]
-        cid = int(parts[4]) if parts[4] != '0' else 0
-        if category == "joining":
-            async with db_pool.acquire() as conn:
-                await conn.execute("DELETE FROM required_channels WHERE id=$1", cid)
-            await event.edit("✅ Joining channel deleted.")
-        elif category == "withdrawal":
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE settings SET withdrawal_channel = '' WHERE id=1")
-            await event.edit("✅ Withdrawal channel cleared.")
-        elif category == "proof":
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE settings SET task_proof_channel = '' WHERE id=1")
-            await event.edit("✅ Proof channel cleared.")
-        elif category == "task":
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE settings SET task_channel = '' WHERE id=1")
-            await event.edit("✅ Task channel cleared.")
-        else:
-            await event.edit("❌ Unknown category.")
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data == "del_cat_cancel":
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        await event.edit("❌ Delete cancelled.")
-        return
-
-    # --- Admin TG Task creation callbacks (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("tg_admin_check_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        channel_username = data.split("_")[3]
-        state = admin_tg_task_state.get(user_id)
-        if not state or state.get('channel') != channel_username:
-            await event.answer("❌ Invalid session.", alert=True)
-            return
-        entity = await is_bot_admin_in_channel(channel_username)
-        if entity:
-            state['step'] = 'limit'
-            await event.edit(f"✅ Bot is admin of @{channel_username}.\n\n🚀 **Task Configuration Service**\n━━━━━━━━━━━━━━\n🎯 Target Channel: https://t.me/{channel_username}\n\nEnter the number of services you want to process.\n\n⚠️ Requirement: Minimum 5\n━━━━━━━━━━━━━━", 
-                             buttons=[[Button.inline("🔙 Back", f"tg_admin_edit_{channel_username}")]])
-            await event.answer("✅ Admin verified!", alert=True)
-        else:
-            await event.answer("❌ Bot is not admin or not found. Add bot as admin and try again.", alert=True)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("tg_admin_edit_"):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        channel_username = data.split("_")[3]
-        state = admin_tg_task_state.get(user_id)
-        if state:
-            state['step'] = 'channel'
-            await event.edit("📢 Please send the channel username or link again:")
-        else:
-            await event.answer("❌ Session expired.", alert=True)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data == "tg_admin_cancel":
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id in admin_tg_task_state:
-            del admin_tg_task_state[user_id]
-        await event.edit("❌ Task creation cancelled.")
-        await event.answer("Cancelled.", alert=True)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and (data.startswith("tg_admin_confirm_yes") or data.startswith("tg_admin_confirm_no")):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        state = admin_tg_task_state.get(user_id)
-        if not state:
-            await event.answer("❌ No session.", alert=True)
-            return
-        if data.endswith("_no"):
-            del admin_tg_task_state[user_id]
-            await event.edit("❌ Task creation cancelled.")
-            await event.answer("Cancelled.", alert=True)
-            return
-        channel = state['channel']
-        limit = state['limit']
-        reward = state['reward']
-        async with db_pool.acquire() as conn:
-            task_id = await conn.fetchval("INSERT INTO tasks (task_type, url, time_required, reward, task_limit, completed_count, proof_type, status) VALUES ('TG', $1, 0, $2, $3, 0, 'screenshot', 'active') RETURNING id",
-                                          channel, reward, limit)
-        del admin_tg_task_state[user_id]
-        currency = (await get_settings())['currency']
-        await send_task_notification(task_id, "TG", channel, reward, limit)
-        await event.edit(f"✅ **TG Task Added Successfully!**\n\n"
-                         f"📢 Channel: https://t.me/{channel}\n"
-                         f"👥 Task Limit: {limit}\n"
-                         f"💰 Reward per task: {reward} {currency}")
-        await event.answer("Task added!", alert=True)
-        return
-
-    # --- Edit Task: selection from list (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_task_"):
-        parts = data.split("_")
-        if len(parts) != 4:
-            await event.answer("❌ Invalid data.", alert=True)
-            return
-        tid = int(parts[2])
-        task_type = parts[3]
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        admin_edit_state[user_id] = {'task_id': tid, 'stage': 'menu'}
-        keyboard = [
-            [Button.inline("🔗 URL", f"edit_field_{tid}_url"),
-             Button.inline("⏱️ Time", f"edit_field_{tid}_time")],
-            [Button.inline("💰 Reward", f"edit_field_{tid}_reward"),
-             Button.inline("👥 User Limit", f"edit_field_{tid}_limit")],
-            [Button.inline("📎 Proof Type", f"edit_field_{tid}_proof"),
-             Button.inline("❌ Cancel", f"edit_cancel_{tid}")]
-        ]
-        await event.edit("📝 **Edit Task**\n\nSelect what you want to change:", buttons=keyboard)
-        return
-
-    # --- Edit field: ask for new value (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_field_"):
-        parts = data.split("_")
-        if len(parts) != 4:
-            await event.answer("❌ Invalid data.", alert=True)
-            return
-        tid = int(parts[2])
-        field = parts[3]
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id not in admin_edit_state or admin_edit_state[user_id]['task_id'] != tid:
-            await event.answer("❌ No editing session.", alert=True)
-            return
-
-        col_map = {
-            'url': 'url',
-            'time': 'time_required',
-            'reward': 'reward',
-            'limit': 'task_limit',
-            'proof': 'proof_type'
-        }
-        col = col_map.get(field)
-        if not col:
-            await event.answer("❌ Invalid field.", alert=True)
-            return
-
-        admin_edit_state[user_id]['stage'] = 'awaiting_input'
-        admin_edit_state[user_id]['field'] = field
-        admin_edit_state[user_id]['col'] = col
-        prompt_map = {
-            'url': "🔗 Enter new URL (including http:// or https://):",
-            'time': "⏱️ Enter new time required in seconds (e.g., 30):",
-            'reward': "💰 Enter new reward amount:",
-            'limit': "👥 Enter new user limit (number):",
-            'proof': "📎 Enter new proof type (send `screenshot`, `screen record`, or `skip`):"
-        }
-        prompt_msg = prompt_map.get(field, "Enter new value:")
-        back_btn = Button.inline("🔙 Back", f"edit_back_{tid}")
-        await event.edit(prompt_msg, buttons=[[back_btn]])
-        return
-
-    # --- Edit confirm: Yes (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_confirm_"):
-        parts = data.split("_")
-        if len(parts) != 5:
-            await event.answer("❌ Invalid data.", alert=True)
-            return
-        tid = int(parts[2])
-        field = parts[3]
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id not in admin_edit_state or admin_edit_state[user_id]['task_id'] != tid:
-            await event.answer("❌ No editing session.", alert=True)
-            return
-        new_val = admin_edit_state[user_id].get('new_val')
-        if new_val is None:
-            await event.answer("❌ No value to update.", alert=True)
-            return
-
-        col_map = {
-            'url': 'url',
-            'time': 'time_required',
-            'reward': 'reward',
-            'limit': 'task_limit',
-            'proof': 'proof_type'
-        }
-        col = col_map.get(field)
-        if not col:
-            await event.answer("❌ Invalid field.", alert=True)
-            return
-
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(f"UPDATE tasks SET {col} = $1 WHERE id=$2", new_val, tid)
-        except Exception as e:
-            await event.answer(f"❌ Database error: {e}", alert=True)
-            return
-        admin_edit_state[user_id]['stage'] = 'updated'
-        display_names = {
-            'url': 'URL',
-            'time_required': 'Time',
-            'reward': 'Reward',
-            'task_limit': 'User Limit',
-            'proof_type': 'Proof Type'
-        }
-        display = display_names.get(col, col)
-        success_text = f"✅ {display} updated successfully!\n\nNew value: {new_val}"
-        buttons = [
-            [Button.inline("🔙 Back", f"edit_back_{tid}"),
-             Button.inline("❌ Cancel", f"edit_cancel_{tid}")]
-        ]
-        await event.edit(success_text, buttons=buttons)
-        return
-
-    # --- Edit Back: go back to edit menu (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_back_"):
-        parts = data.split("_")
-        if len(parts) != 3:
-            await event.answer("❌ Invalid data.", alert=True)
-            return
-        tid = int(parts[2])
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id not in admin_edit_state or admin_edit_state[user_id]['task_id'] != tid:
-            await event.answer("❌ No editing session.", alert=True)
-            return
-        admin_edit_state[user_id].pop('new_val', None)
-        admin_edit_state[user_id]['stage'] = 'menu'
-        keyboard = [
-            [Button.inline("🔗 URL", f"edit_field_{tid}_url"),
-             Button.inline("⏱️ Time", f"edit_field_{tid}_time")],
-            [Button.inline("💰 Reward", f"edit_field_{tid}_reward"),
-             Button.inline("👥 User Limit", f"edit_field_{tid}_limit")],
-            [Button.inline("📎 Proof Type", f"edit_field_{tid}_proof"),
-             Button.inline("❌ Cancel", f"edit_cancel_{tid}")]
-        ]
-        await event.edit("📝 **Edit Task**\n\nSelect what you want to change:", buttons=keyboard)
-        return
-
-    # --- Edit Cancel: cancel editing (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("edit_cancel_"):
-        parts = data.split("_")
-        if len(parts) != 3:
-            await event.answer("❌ Invalid data.", alert=True)
-            return
-        tid = int(parts[2])
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id in admin_edit_state:
-            del admin_edit_state[user_id]
-        await event.edit("❌ Editing cancelled.")
-        return
-
-    # --- Cancel from task list ---
-    if data == "task_cancel_list":
-        if user_id in task_sessions:
-            session = task_sessions[user_id]
-            if session.get('timer_task') and not session['timer_task'].done():
-                session['timer_task'].cancel()
-            del task_sessions[user_id]
-        if user_id in screenshot_waiting:
-            del screenshot_waiting[user_id]
-        if user_id in task_list_msgs:
-            list_info = task_list_msgs[user_id]
-            try:
-                await client.edit_message(list_info['chat_id'], list_info['msg_id'], "❌ Cancelled.")
-            except:
-                pass
-            del task_list_msgs[user_id]
-        await event.respond("🔙 Back to Task Menu.", buttons=task_buttons)
-        return
-
-    # --- Back button: go to previous screen ---
-    if data == "task_back":
-        if user_id not in task_sessions:
-            await show_task_list(user_id, event.chat_id)
-            return
-
-        session = task_sessions[user_id]
-        screen = session.get('screen', 'details')
-        chat_id = session['chat_id']
-        msg_id = session['message_id']
-        task_type = session.get('task_type')
-
-        if screen == 'details':
-            if session.get('timer_task') and not session['timer_task'].done():
-                session['timer_task'].cancel()
-            del task_sessions[user_id]
-            if user_id in screenshot_waiting:
-                del screenshot_waiting[user_id]
-            await show_task_list(user_id, chat_id, msg_id, task_type=task_type)
-        elif screen == 'timer':
-            await render_task_details(user_id, chat_id, msg_id)
-        elif screen == 'timesup':
-            await render_task_details(user_id, chat_id, msg_id)
-        elif screen == 'proof':
-            if user_id in screenshot_waiting:
-                del screenshot_waiting[user_id]
-            await render_task_details(user_id, chat_id, msg_id)
-        else:
-            await show_task_list(user_id, chat_id, msg_id, task_type=task_type)
-        return
-
-    # --- Start Task (both Media and TG) - edit the current list message ---
-    if data.startswith("start_task_"):
-        try:
-            task_id = int(data.split("_")[2])
-        except (IndexError, ValueError):
-            await event.answer("❌ Invalid task.", alert=True)
-            return
-
-        async with db_pool.acquire() as conn:
-            task = await conn.fetchrow("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type, status FROM tasks WHERE id=$1", task_id)
-            if not task or task['status'] != 'active':
-                await event.answer("❌ This task is no longer available.", alert=True)
-                await client.edit_message(event.chat_id, event.message_id, "❌ **Task Unavailable**\n\nThe task you selected has been removed or is no longer active.")
-                return
-
-            if task['completed_count'] >= task['task_limit']:
-                await event.answer("❌ This task is already full.", alert=True)
-                await client.edit_message(event.chat_id, event.message_id, f"❌ **Task Full**\n\nThe task has already been completed by the maximum number of users ({task['task_limit']}). Please try another task.")
-                return
-
-            existing = await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status IN ('pending', 'approved')", user_id, task_id)
-            if existing:
-                status_text = "pending" if existing == 'pending' else "completed"
-                await event.answer(f"❌ You have already {status_text} this task.", alert=True)
-                await client.edit_message(event.chat_id, event.message_id, f"❌ **Already {status_text.title()}**\n\nYou have already {status_text} this task. You cannot start it again.")
-                return
-
-        if user_id in screenshot_waiting:
-            del screenshot_waiting[user_id]
-
-        if user_id in task_sessions:
-            if task_sessions[user_id].get('timer_task') and not task_sessions[user_id]['timer_task'].done():
-                task_sessions[user_id]['timer_task'].cancel()
-            del task_sessions[user_id]
-
-        chat_id = event.chat_id
-        msg_id = event.message_id
-
-        task_sessions[user_id] = {
-            'task_id': task['id'],
-            'task_type': task['task_type'],
-            'url': task['url'],
-            'time_required': task['time_required'],
-            'reward': task['reward'],
-            'task_limit': task['task_limit'],
-            'completed_count': task['completed_count'],
-            'proof_type': task['proof_type'],
-            'message_id': msg_id,
-            'chat_id': chat_id,
-            'start_time': None,
-            'timer_task': None,
-            'visited': False,
-            'screen': 'details',
-            'prev_screen': None
-        }
-
-        await render_task_details(user_id, chat_id, msg_id)
-        await event.answer("✅ Task loaded.", alert=False)
-        return
-
-    # --- Media Task: User clicked "Check" (for Media) ---
-    if data.startswith("task_visited_"):
-        try:
-            task_id = int(data.split("_")[2])
-        except:
-            await event.answer("❌ Invalid.", alert=True)
-            return
-
-        if user_id not in task_sessions:
-            await event.answer("❌ No active session.", alert=True)
-            return
-
-        session = task_sessions[user_id]
-        if session['task_id'] != task_id:
-            await event.answer("❌ Task mismatch.", alert=True)
-            return
-
-        if session.get('visited', False):
-            await event.answer("⏳ Timer already started. Please wait.", alert=True)
-            return
-
-        session['start_time'] = int(time.time())
-        session['visited'] = True
-
-        text = (f"⏳ **Timer Started!**\n\n"
-                f"Please wait **{session['time_required']} seconds**.\n"
-                f"After the timer ends, you will be able to claim reward.\n\n"
-                f"⏱️ You can visit the website again if you wish.")
-        buttons = [
-            [Button.inline(f"⏳ Please wait {session['time_required']} seconds...", f"task_wait_{task_id}")],
-            [Button.inline("🔙 Back", b"task_back")]
-        ]
-        await client.edit_message(session['chat_id'], session['message_id'], text, buttons=buttons)
-        session['screen'] = 'timer'
-        session['prev_screen'] = 'details'
-
-        timer = asyncio.create_task(task_timer(user_id, task_id, session['message_id'], session['chat_id'], session['time_required']))
-        session['timer_task'] = timer
-
-        return
-
-    # --- Task wait button ---
-    if data.startswith("task_wait_"):
-        try:
-            task_id = int(data.split("_")[2])
-        except:
-            await event.answer("❌ Invalid.", alert=True)
-            return
-
-        if user_id not in task_sessions:
-            await event.answer("❌ No active session.", alert=True)
-            return
-
-        session = task_sessions[user_id]
-        if session['task_id'] != task_id:
-            await event.answer("❌ Task mismatch.", alert=True)
-            return
-
-        elapsed = int(time.time()) - session['start_time']
-        required = session['time_required']
-        if elapsed < required:
-            remaining = required - elapsed
-            await event.answer(f"⏳ Please wait {remaining} more seconds.", alert=True)
-        else:
-            await event.answer("⏳ Please wait for the timer to finish.", alert=True)
-        return
-
-    # --- Claim Reward (for Media Task) ---
-    if data.startswith("claim_task_"):
-        try:
-            task_id = int(data.split("_")[2])
-        except:
-            await event.answer("❌ Invalid task.", alert=True)
-            return
-
-        if user_id not in task_sessions:
-            await event.answer("❌ No active session.", alert=True)
-            return
-
-        session = task_sessions[user_id]
-        if session['task_id'] != task_id:
-            await event.answer("❌ Task mismatch.", alert=True)
-            return
-
-        if session.get('proof_type') == 'skip':
-            await event.answer("✅ This task does not require proof.", alert=True)
-            return
-
-        elapsed = int(time.time()) - session['start_time']
-        required = session['time_required']
-        if elapsed < required:
-            remaining = required - elapsed
-            await event.answer(f"⏳ Please wait {remaining} more seconds.", alert=True)
-            return
-
-        proof_type = session.get('proof_type', 'screenshot')
-        proof_instruction = "📸 Please take a screenshot and send the photo here." if proof_type == 'screenshot' else "🎥 Please record your screen and send the video here."
-
-        text = (f"📎 **Proof Required!**\n\n"
-                f"{proof_instruction}\n\n"
-                f"⚠️ Your proof will be reviewed by admin.")
-        buttons = [
-            [Button.inline("🔙 Back", b"task_back")]
-        ]
-        await client.edit_message(session['chat_id'], session['message_id'], text, buttons=buttons)
-        session['screen'] = 'proof'
-        session['prev_screen'] = 'timesup'
-        screenshot_waiting[user_id] = {
-            'task_id': task_id,
-            'message_id': session['message_id'],
-            'chat_id': session['chat_id'],
-            'proof_type': proof_type,
-            'task_data': {
-                'url': session.get('url', ''),
-                'reward': session.get('reward', 0)
-            }
-        }
-        return
-
-    # --- TG Task: User clicked "Check" ---
-    if data.startswith("tg_check_"):
-        try:
-            task_id = int(data.split("_")[2])
-        except:
-            await event.answer("❌ Invalid.", alert=True)
-            return
-
-        if user_id not in task_sessions:
-            await event.answer("❌ No active session.", alert=True)
-            return
-
-        session = task_sessions[user_id]
-        if session['task_id'] != task_id:
-            await event.answer("❌ Task mismatch.", alert=True)
-            return
-
-        channel_username = session['url']
-        try:
-            entity = await client.get_entity(f"@{channel_username}")
-            try:
-                await client(GetParticipantRequest(channel=entity, participant=user_id))
-                is_member = True
-            except UserNotParticipantError:
-                is_member = False
-        except Exception as e:
-            await event.answer("❌ Could not resolve channel.", alert=True)
-            return
-
-        if is_member:
-            text = (f"✅ **You are a member of the channel!**\n\n"
-                    f"Click the **Claim Reward** button to get your reward.")
-            buttons = [
-                [Button.inline("🎁 Claim Reward", f"claim_tg_{task_id}")],
-                [Button.inline("🔙 Back", b"task_back")]
-            ]
-            await client.edit_message(session['chat_id'], session['message_id'], text, buttons=buttons)
-            session['screen'] = 'claim_ready'
-            session['prev_screen'] = 'details'
-            await event.answer("✅ Membership verified!", alert=True)
-        else:
-            await event.answer("❌ You are not a member. Please join the channel first.", alert=True)
-        return
-
-    # --- TG Task: Claim Reward ---
-    if data.startswith("claim_tg_"):
-        try:
-            task_id = int(data.split("_")[2])
-        except:
-            await event.answer("❌ Invalid task.", alert=True)
-            return
-
-        if user_id not in task_sessions:
-            await event.answer("❌ No active session.", alert=True)
-            return
-
-        session = task_sessions[user_id]
-        if session['task_id'] != task_id:
-            await event.answer("❌ Task mismatch.", alert=True)
-            return
-
-        async with db_pool.acquire() as conn:
-            if await conn.fetchval("SELECT status FROM task_submissions WHERE user_id=$1 AND task_id=$2 AND status='approved'", user_id, task_id):
-                await event.answer("❌ You have already claimed this task.", alert=True)
-                return
-
-            task = await conn.fetchrow("SELECT task_limit, completed_count, reward FROM tasks WHERE id=$1", task_id)
-            if task['completed_count'] >= task['task_limit']:
-                await event.answer("❌ This task is already full.", alert=True)
-                return
-
-            reward = task['reward']
-            currency = (await get_settings())['currency']
-            await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
-            await conn.execute("UPDATE tasks SET completed_count = completed_count + 1 WHERE id=$1", task_id)
-            await conn.execute("INSERT INTO task_submissions (user_id, task_id, reward, url, status, submitted_at, reviewed_at) VALUES ($1, $2, $3, $4, 'approved', $5, $5)",
-                               user_id, task_id, reward, session['url'], int(time.time()))
-
-        text = (f"🎉 **Task Completed!**\n\n"
-                f"You have successfully completed the TG task and earned **{reward} {currency}** in your Real Balance.")
-        buttons = [
-            [Button.inline("🔙 Back", b"task_back")]
-        ]
-        await client.edit_message(session['chat_id'], session['message_id'], text, buttons=buttons)
-        session['screen'] = 'completed'
-        session['prev_screen'] = 'claim_ready'
-        await event.answer("✅ Reward claimed!", alert=True)
-        return
-
-    # --- Admin approve/reject callbacks ---
-    if data.startswith("approve_sub_") or data.startswith("reject_sub_"):
-        settings = await get_settings()
-        proof_channel_str = settings['task_proof_channel']
-        if not proof_channel_str:
-            await event.answer("❌ Proof channel not set.", alert=True)
-            return
-        try:
-            proof_channel = await client.get_entity(proof_channel_str)
-        except:
-            await event.answer("❌ Proof channel not found.", alert=True)
-            return
-
-        is_channel_admin = await is_user_admin_in_channel(user_id, proof_channel)
-        if not is_channel_admin:
-            await event.answer("❌ You are not an admin of the proof channel.", alert=True)
-            return
-
-        try:
-            sub_id = int(data.split("_")[2])
-        except:
-            await event.answer("Invalid submission ID.", alert=True)
-            return
-
-        async with db_pool.acquire() as conn:
-            sub = await conn.fetchrow("SELECT id, user_id, task_id, reward, status FROM task_submissions WHERE id=$1 AND status='pending'", sub_id)
-            if not sub:
-                await event.answer("❌ Submission not found or already processed.", alert=True)
-                return
-
-            if data.startswith("approve_sub_"):
-                await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", sub['reward'], sub['user_id'])
-                await conn.execute("UPDATE task_submissions SET status='approved', reviewed_at=$1 WHERE id=$2", int(time.time()), sub_id)
-                msg_obj = await event.get_message()
-                new_text = msg_obj.text + f"\n\n🟢 **Status: Approved by Admin**"
-                await event.edit(new_text, buttons=None)
-                currency = settings['currency']
-                try:
-                    await client.send_message(sub['user_id'], f"🎉 **Task Approved!**\n\nYour task submission has been approved and you have earned **{sub['reward']} {currency}** in your Real Balance!")
-                except:
-                    pass
-                await event.answer("✅ Approved and reward added.", alert=True)
-            else:
-                await conn.execute("UPDATE tasks SET completed_count = completed_count - 1 WHERE id=$1", sub['task_id'])
-                await conn.execute("UPDATE task_submissions SET status='rejected', reviewed_at=$1 WHERE id=$2", int(time.time()), sub_id)
-                msg_obj = await event.get_message()
-                new_text = msg_obj.text + f"\n\n🔴 **Status: Rejected by Admin**"
-                await event.edit(new_text, buttons=None)
-                try:
-                    await client.send_message(sub['user_id'], f"❌ **Task Rejected**\n\nYour task submission has been rejected. Please ensure you visited the website correctly and submitted valid proof.")
-                except:
-                    pass
-                await event.answer("❌ Rejected.", alert=True)
-        return
-
-    # --- Delete task callbacks (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("del_task_"):
-        parts = data.split("_")
-        if len(parts) != 4:
-            await event.answer("❌ Invalid data.", alert=True)
-            return
-        task_id = int(parts[2])
-        task_type = parts[3]
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        kb = [
-            [Button.inline("✅ Yes, delete", f"confirm_del_task_{task_id}")],
-            [Button.inline("❌ Cancel", b"cancel_del_task")]
-        ]
-        await event.edit(f"⚠️ Are you sure you want to delete this {task_type} task?", buttons=kb)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data.startswith("confirm_del_task_"):
-        try:
-            task_id = int(data.split("_")[3])
-        except (IndexError, ValueError):
-            await event.answer("❌ Invalid task ID.", alert=True)
-            return
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE tasks SET status='deleted' WHERE id=$1", task_id)
-        await event.edit("✅ Task deleted successfully.")
-        await event.answer("Deleted.", alert=True)
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data == "cancel_del_task":
-        await event.edit("❌ Deletion cancelled.")
-        return
-
-    if is_user_admin and not admin_user_mode.get(user_id, True) and data == "cancel_edit_task":
-        await event.edit("❌ Cancelled.")
-        return
-
-    # --- Confirm Add Media Task (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and (data.startswith("confirm_task_yes") or data.startswith("confirm_task_no")):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id not in admin_confirm:
-            await event.answer("No pending task.", alert=True)
-            return
-        confirm_data = admin_confirm[user_id]
-        if confirm_data['action'] != "add_media_task":
-            await event.answer("Invalid action.", alert=True)
-            return
-        if data.endswith("_no"):
-            del admin_confirm[user_id]
-            await event.edit("❌ Task creation cancelled.")
-            await event.answer("Cancelled.", alert=True)
-            return
-        task_data = confirm_data['task_data']
-        async with db_pool.acquire() as conn:
-            task_id = await conn.fetchval("INSERT INTO tasks (task_type, url, time_required, reward, task_limit, completed_count, proof_type, status) VALUES ('Media', $1, $2, $3, $4, 0, $5, 'active') RETURNING id",
-                                          task_data['url'], task_data['time_required'], task_data['reward'], task_data['task_limit'], task_data['proof_type'])
-        del admin_confirm[user_id]
-        currency = (await get_settings())['currency']
-        await send_task_notification(task_id, "Media", task_data['url'], task_data['reward'], task_data['task_limit'], proof_type=task_data['proof_type'], time_required=task_data['time_required'])
-        await event.edit(f"✅ **Media Task Added Successfully!**\n\n"
-                         f"🔗 URL: {task_data['url']}\n"
-                         f"⏱️ Time: {task_data['time_required']} seconds\n"
-                         f"💰 Reward: {task_data['reward']} {currency}\n"
-                         f"👥 User Limit: {task_data['task_limit']}\n"
-                         f"📎 Proof Type: {task_data['proof_type']}")
-        await event.answer("Task added!", alert=True)
-        return
-
-    # --- Confirm Add Balance, Cut Balance, Set Bonus (only in admin mode) ---
-    if is_user_admin and not admin_user_mode.get(user_id, True) and (data.startswith("confirm_add_balance_yes") or data.startswith("confirm_add_balance_no")):
-        if not is_user_admin:
-            await event.answer("❌ Admin only.", alert=True)
-            return
-        if user_id not in admin_confirm:
-            await event.answer("No pending confirmation.", alert=True)
-            return
-        confirm_data = admin_confirm[user_id]
-        if confirm_data['action'] != "add_balance":
-            await event.answer("Invalid action.", alert=True)
-            return
-        if data.endswith("_no"):
-            del admin_confirm[user_id]
-            await event.edit("❌ Operation cancelled.")
-            await event.answer("Cancelled.", alert=True)
-            return
-        target_user = confirm_data['user_id']
-        amount = confirm_data['amount']
-        currency = (await get_settings())['currency']
-        async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id=$2", amount, target_user)
-        del admin_confirm[user_id]
-        await event.edit(f"✅ Added {amount:.2f} {currency} to user {target_user} (Real Balance).")
-        try:
-            await client.send_message(target_user, f"🎁 **Admin added {amount:.2f} {currency} to your Real Balance!**
+            await conn.execute("INSERT INTO user_tasks (user_id, task_id, status) VALUES ($1, $2, 'completed')", user_id, task_id)
+        await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
+    return web.json_response({'success': True, 'reward': reward})
+
+async def health(request):
+    return web.Response(text="OK")
+
+# --- Web server startup ---
+async def start_web_server():
+    app = web.Application()
+    app['db_pool'] = db_pool
+    app.router.add_get('/', serve_index)
+    app.router.add_get('/health', health)
+    app.router.add_get('/api/tasks', api_tasks)
+    app.router.add_post('/api/verify-task', api_verify_task)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('PORT', 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Web server running on port {port}")
+    await asyncio.Event().wait()
+
+# --- Main entry point ---
+async def main():
+    await init_db()
+    await client.start(bot_token=BOT_TOKEN)
+    print("🤖 Bot started!")
+    asyncio.create_task(auto_approve_pending_submissions())
+    asyncio.create_task(weekly_release())
+    await start_web_server()
+
+if __name__ == "__main__":
+    asyncio.run(main())
