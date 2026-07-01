@@ -1,4 +1,4 @@
-telethon
-pytz
+telethon>=1.34.0
 aiohttp
 asyncpg
+pytz
