@@ -1,6 +1,10 @@
 import os
 import time
 import asyncio
+import json
+import hmac
+import hashlib
+from urllib.parse import parse_qs
 from datetime import datetime, timedelta
 import pytz
 from telethon import TelegramClient, events, Button
@@ -190,6 +194,30 @@ async def init_db():
             )
         ''')
         await conn.execute("INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", MAIN_ADMIN_ID)
+        
+        # --- NEW: Mini App user_tasks table ---
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_tasks (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                task_id INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, task_id)
+            )
+        ''')
+        
+        # Insert demo tasks for Mini App if empty
+        count = await conn.fetchval("SELECT COUNT(*) FROM tasks WHERE task_type IN ('TG', 'Media')")
+        if count == 0:
+            await conn.execute("""
+                INSERT INTO tasks (task_type, url, time_required, reward, task_limit, completed_count, proof_type, status)
+                VALUES 
+                ('TG', 'your_channel', 0, 10, 100, 0, 'screenshot', 'active'),
+                ('Media', 'https://example.com', 30, 15, 50, 0, 'screenshot', 'active')
+            """)
+    print("✅ Database initialized with Mini App tables")
 
 # --- Database helper functions ---
 async def is_admin(user_id):
@@ -796,6 +824,18 @@ async def admin_panel(event):
         return
     admin_user_mode[event.sender_id] = False
     await event.respond("🛠 **Admin Panel**", buttons=admin_keyboard)
+
+# --- /earn COMMAND (MINI APP) ---
+@client.on(events.NewMessage(pattern='/earn'))
+async def earn_command(event):
+    """Open the Earn Tasks Mini App"""
+    # Get the base URL from environment or use default
+    base_url = os.environ.get("APP_URL", "https://your-domain.com")
+    await event.respond(
+        "📋 **Earn Tasks**\n\n"
+        "Complete tasks and earn rewards! 🎁",
+        buttons=[[Button.webview("🚀 Open Earn Page", base_url)]]
+    )
 
 # --- TEXT HANDLER ---
 @client.on(events.NewMessage)
@@ -3150,14 +3190,89 @@ async def callback(event):
         await event.edit(msg, buttons=kb)
         return
 
-# --- Web server for Render health checks ---
+# --- Web server with Mini App routes ---
+async def serve_index(request):
+    """Serve the Mini App HTML"""
+    # Check if static folder exists
+    static_path = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
+    if os.path.exists(static_path):
+        with open(static_path, 'r', encoding='utf-8') as f:
+            return web.Response(text=f.read(), content_type='text/html')
+    else:
+        return web.Response(text="<h1>index.html not found. Please create static/index.html</h1>", content_type='text/html')
+
+async def api_tasks(request):
+    """Get tasks list with user completion status"""
+    init_data = request.headers.get('X-Telegram-Init-Data')
+    if not init_data:
+        return web.json_response({'error': 'Missing init data'}, status=400)
+    try:
+        user = verify_init_data(init_data)
+    except Exception:
+        return web.json_response({'error': 'Invalid init data'}, status=403)
+    user_id = user['id']
+    async with db_pool.acquire() as conn:
+        tasks = await conn.fetch("SELECT id, task_type, url, time_required, reward, task_limit, completed_count, proof_type FROM tasks WHERE status='active'")
+        completed = await conn.fetch("SELECT task_id FROM user_tasks WHERE user_id=$1 AND status='completed'", user_id)
+        completed_ids = {r['task_id'] for r in completed}
+        result = []
+        for t in tasks:
+            status = 'completed' if t['id'] in completed_ids else 'pending'
+            if t['task_type'] == 'TG':
+                title = f"Join @{t['url']}"
+            else:
+                title = f"Visit {t['url']}"
+            result.append({
+                'id': t['id'],
+                'title': title,
+                'link': t['url'],
+                'reward': t['reward'],
+                'task_type': t['task_type'],
+                'status': status
+            })
+    return web.json_response(result)
+
+async def api_verify_task(request):
+    """Verify task and add reward to user"""
+    init_data = request.headers.get('X-Telegram-Init-Data')
+    if not init_data:
+        return web.json_response({'error': 'Missing init data'}, status=400)
+    try:
+        user = verify_init_data(init_data)
+    except Exception:
+        return web.json_response({'error': 'Invalid init data'}, status=403)
+    user_id = user['id']
+    try:
+        data = await request.json()
+        task_id = int(data.get('task_id'))
+    except:
+        return web.json_response({'error': 'Invalid request'}, status=400)
+    
+    async with db_pool.acquire() as conn:
+        task = await conn.fetchrow("SELECT id, reward FROM tasks WHERE id=$1 AND status='active'", task_id)
+        if not task:
+            return web.json_response({'success': False, 'message': 'Task not available'})
+        existing = await conn.fetchrow("SELECT id, status FROM user_tasks WHERE user_id=$1 AND task_id=$2", user_id, task_id)
+        if existing and existing['status'] == 'completed':
+            return web.json_response({'success': False, 'message': 'Already completed'})
+        reward = task['reward']
+        if existing:
+            await conn.execute("UPDATE user_tasks SET status='completed', updated_at=NOW() WHERE id=$1", existing['id'])
+        else:
+            await conn.execute("INSERT INTO user_tasks (user_id, task_id, status) VALUES ($1, $2, 'completed')", user_id, task_id)
+        # Add reward to user's balance
+        await conn.execute("UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE user_id=$2", reward, user_id)
+    return web.json_response({'success': True, 'reward': reward})
+
 async def health(request):
     return web.Response(text="OK")
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', health)
+    app.router.add_get('/', serve_index)
     app.router.add_get('/health', health)
+    app.router.add_get('/api/tasks', api_tasks)
+    app.router.add_post('/api/verify-task', api_verify_task)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 8080))
