@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Earn Tasks</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f13;
+            color: #e0e0e0;
+            padding: 20px 16px 40px;
+            min-height: 100vh;
+        }
+        .container { max-width: 480px; margin: 0 auto; }
+        h1 {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 24px;
+            background: linear-gradient(135deg, #f0b90b, #f5d75c);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .task-list { display: flex; flex-direction: column; gap: 16px; }
+        .task-card {
+            background: #1a1a22;
+            border-radius: 16px;
+            padding: 16px 18px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border: 1px solid #2a2a35;
+            transition: all 0.2s;
+        }
+        .task-info { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+        .task-title { font-size: 16px; font-weight: 600; }
+        .task-reward { font-size: 14px; color: #f5b342; font-weight: 500; }
+        .task-btn {
+            padding: 8px 18px;
+            border: none;
+            border-radius: 30px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.25s;
+            background: #2d2d3a;
+            color: #c0c0d0;
+            min-width: 80px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+        .task-btn.start { background: #f0b90b; color: #0f0f13; }
+        .task-btn.start:active { transform: scale(0.95); }
+        .task-btn.verify { background: #3b82f6; color: white; }
+        .task-btn.verify.loading {
+            background: #1e293b;
+            color: #94a3b8;
+            pointer-events: none;
+        }
+        .task-btn.done { background: #22c55e; color: white; opacity: 0.6; cursor: default; }
+        .task-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top: 2px solid #f0b90b;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .status-badge {
+            font-size: 12px;
+            padding: 2px 10px;
+            border-radius: 20px;
+            background: #2a2a35;
+        }
+        .status-badge.done { background: #22c55e20; color: #22c55e; }
+        .status-badge.pending { background: #f0b90b20; color: #f0b90b; }
+        .empty-state { text-align: center; padding: 40px 0; color: #6a6a7a; }
+        @media (max-width: 400px) {
+            .task-card { flex-wrap: wrap; gap: 10px; }
+            .task-btn { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📋 Earn Tasks</h1>
+        <div id="taskList" class="task-list">
+            <div class="empty-state">Loading tasks...</div>
+        </div>
+    </div>
+
+    <script>
+        function getInitData() {
+            if (window.Telegram && window.Telegram.WebApp) {
+                return window.Telegram.WebApp.initData;
+            }
+            // Fallback for local testing (set dummy)
+            return 'query_id=...&user=%7B%22id%22%3A123456%2C%22first_name%22%3A%22Test%22%7D&auth_date=...&hash=...';
+        }
+
+        async function fetchTasks() {
+            const res = await fetch('/api/tasks', {
+                headers: { 'X-Telegram-Init-Data': getInitData() }
+            });
+            if (!res.ok) throw new Error('Failed to fetch tasks');
+            return res.json();
+        }
+
+        async function verifyTask(taskId) {
+            const res = await fetch('/api/verify-task', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Telegram-Init-Data': getInitData()
+                },
+                body: JSON.stringify({ task_id: taskId })
+            });
+            return res.json();
+        }
+
+        function renderTasks(tasks) {
+            const container = document.getElementById('taskList');
+            if (!tasks || tasks.length === 0) {
+                container.innerHTML = '<div class="empty-state">No tasks available right now.</div>';
+                return;
+            }
+            let html = '';
+            tasks.forEach(task => {
+                const isCompleted = task.status === 'completed';
+                const btnClass = isCompleted ? 'done' : 'start';
+                const btnText = isCompleted ? 'Claimed ✓' : 'Start';
+                const statusBadge = isCompleted
+                    ? '<span class="status-badge done">Done</span>'
+                    : '<span class="status-badge pending">Pending</span>';
+                html += `
+                    <div class="task-card" data-task-id="${task.id}" data-status="${task.status}">
+                        <div class="task-info">
+                            <div class="task-title">${task.title}</div>
+                            <div class="task-reward">🎁 ${task.reward} TRX</div>
+                            ${statusBadge}
+                        </div>
+                        <button class="task-btn ${btnClass}" data-task-id="${task.id}">${btnText}</button>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+            document.querySelectorAll('.task-btn.start:not(.done)').forEach(btn => {
+                btn.addEventListener('click', handleStartClick);
+            });
+        }
+
+        async function handleStartClick(e) {
+            const btn = e.currentTarget;
+            const taskCard = btn.closest('.task-card');
+            const taskId = btn.dataset.taskId;
+            if (btn.disabled) return;
+            btn.disabled = true;
+
+            btn.classList.remove('start');
+            btn.classList.add('verify', 'loading');
+            btn.innerHTML = '<span class="spinner"></span> Verifying...';
+
+            try {
+                // Simulate 5-second verification (you can customize)
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                const result = await verifyTask(taskId);
+                if (result.success) {
+                    btn.classList.remove('loading', 'verify');
+                    btn.classList.add('done');
+                    btn.innerHTML = 'Claimed ✓';
+                    btn.disabled = true;
+                    const badge = taskCard.querySelector('.status-badge');
+                    if (badge) {
+                        badge.textContent = 'Done';
+                        badge.className = 'status-badge done';
+                    }
+                } else {
+                    btn.classList.remove('loading', 'verify');
+                    btn.classList.add('start');
+                    btn.innerHTML = 'Start';
+                    btn.disabled = false;
+                    alert(result.message || 'Verification failed. Please try again.');
+                }
+            } catch (error) {
+                console.error(error);
+                btn.classList.remove('loading', 'verify');
+                btn.classList.add('start');
+                btn.innerHTML = 'Start';
+                btn.disabled = false;
+                alert('An error occurred. Please try again later.');
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            try {
+                const tasks = await fetchTasks();
+                renderTasks(tasks);
+            } catch (e) {
+                document.getElementById('taskList').innerHTML =
+                    '<div class="empty-state">⚠️ Failed to load tasks. Please try again later.</div>';
+                console.error(e);
+            }
+        });
+    </script>
+</body>
+</html>
