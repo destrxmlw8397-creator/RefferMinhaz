@@ -12,7 +12,7 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.errors import UserNotParticipantError
 from telethon.tl.types import (
     ChannelParticipantAdmin, ChannelParticipantCreator,
-    KeyboardButtonSimpleWebView, ReplyInlineMarkup, KeyboardButtonRow
+    KeyboardButtonSimpleWebView
 )
 from aiohttp import web
 import asyncpg
@@ -295,6 +295,7 @@ async def init_db():
             )
         ''')
         await conn.execute("INSERT INTO bonus_setting (id, ref_count, bonus_amount) VALUES (1, 0, 0) ON CONFLICT (id) DO NOTHING")
+        # Tasks table with title and link columns
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
                 id SERIAL PRIMARY KEY,
@@ -309,6 +310,18 @@ async def init_db():
                 title TEXT,
                 link TEXT
             )
+        ''')
+        # For existing tables, add columns if missing
+        await conn.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tasks' AND column_name='title') THEN
+                    ALTER TABLE tasks ADD COLUMN title TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tasks' AND column_name='link') THEN
+                    ALTER TABLE tasks ADD COLUMN link TEXT;
+                END IF;
+            END $$;
         ''')
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS task_submissions (
@@ -359,20 +372,15 @@ def fix_url(url):
         return 'https://' + url
     return url
 
-# --- KEYBOARDS (Web App button fixed) ---
-# We'll use a mix of Button.text (from Telethon helper) and raw KeyboardButtonSimpleWebView
+# --- KEYBOARDS (User menu – only Earn button as WebApp) ---
 main_buttons = [
     [Button.text('💰 Balance', resize=True), Button.text('👫 Invite', resize=True)],
     [Button.text('🌾 Staking', resize=True), Button.text('📤 Withdraw', resize=True)],
-    [Button.text('📊 Statistics', resize=True), Button.text('📋 Task', resize=True)],
+    [Button.text('📊 Statistics', resize=True)],
     [KeyboardButtonSimpleWebView("🎯 Earn", WEB_APP_URL)]
 ]
 
-task_buttons = [
-    [Button.text('TG Task', resize=True), Button.text('Media Task', resize=True)],
-    [Button.text('Back', resize=True)]
-]
-
+# Admin keyboards (unchanged)
 admin_keyboard = [
     [Button.text('Set Welcome Bonus'), Button.text('Set Referral Bonus')],
     [Button.text('Set 24h Bonus'), Button.text('Set Min Withdraw')],
@@ -415,17 +423,17 @@ TASK_SETTINGS_COMMANDS = [
 
 USER_COMMANDS = [
     "💰 Balance", "👫 Invite", "🌾 Staking",
-    "📤 Withdraw", "📊 Statistics", "📋 Task"
-]
-
-TASK_COMMANDS = [
-    "TG Task", "Media Task", "Back"
+    "📤 Withdraw", "📊 Statistics"
 ]
 
 CHANNEL_SETTINGS_COMMANDS = [
     "Joining Channel", "Withdrawal Channel", "Proof Channel", "Task Channel",
     "Edit Channel", "Delete Channel", "Back"
 ]
+
+# --- Rest of the bot functions (task_timer, show_task_list, etc.) are kept for /start task_ links ---
+# They are unchanged from your previous code, but we remove the user commands for "📋 Task", "TG Task", "Media Task"
+# The handler for those commands is removed below.
 
 async def get_now():
     tz = pytz.timezone('Asia/Dhaka')
@@ -545,6 +553,7 @@ async def grant_milestone_bonuses(user_id, sets):
     except:
         pass
 
+# The following task functions are kept for the /start task_ links and for admin task creation
 async def task_timer(user_id, task_id, message_id, chat_id, required_time):
     await asyncio.sleep(required_time)
     try:
@@ -1709,7 +1718,7 @@ async def handle_text(event):
     if not user:
         return
 
-    # --- USER COMMANDS ---
+    # --- USER COMMANDS (NO TASK MENU) ---
     if text == '💰 Balance':
         currency = settings['currency']
         real_bal = user['balance']
@@ -1810,19 +1819,6 @@ async def handle_text(event):
             ]
             await event.reply(f"💳 Your current wallet address:\n`{wallet}`\n\nDo you want to proceed with this wallet?", buttons=kb)
             waiting_users[user_id] = 'show_wallet'
-
-    elif text == '📋 Task':
-        await event.respond("📋 **Task Menu**\n\nSelect an option below:", buttons=task_buttons)
-
-    elif text in TASK_COMMANDS:
-        if text == 'Back':
-            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
-        elif text == 'Media Task':
-            await show_task_list(user_id, event.chat_id, task_type='Media')
-        elif text == 'TG Task':
-            await show_task_list(user_id, event.chat_id, task_type='TG')
-        else:
-            await event.reply(f"📌 **{text}**\n\nThis feature is under development. Stay tuned!")
 
     else:
         pass
@@ -2522,12 +2518,12 @@ async def callback(event):
             except:
                 pass
             del task_list_msgs[user_id]
-        await event.respond("🔙 Back to Task Menu.", buttons=task_buttons)
+        await event.respond("🔙 Back to main menu.", buttons=main_buttons)
         return
 
     if data == "task_back":
         if user_id not in task_sessions:
-            await show_task_list(user_id, event.chat_id)
+            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
             return
 
         session = task_sessions[user_id]
@@ -2542,7 +2538,7 @@ async def callback(event):
             del task_sessions[user_id]
             if user_id in screenshot_waiting:
                 del screenshot_waiting[user_id]
-            await show_task_list(user_id, chat_id, msg_id, task_type=task_type)
+            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
         elif screen == 'timer':
             await render_task_details(user_id, chat_id, msg_id)
         elif screen == 'timesup':
@@ -2552,7 +2548,7 @@ async def callback(event):
                 del screenshot_waiting[user_id]
             await render_task_details(user_id, chat_id, msg_id)
         else:
-            await show_task_list(user_id, chat_id, msg_id, task_type=task_type)
+            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
         return
 
     if data.startswith("start_task_"):
