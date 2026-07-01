@@ -431,10 +431,7 @@ CHANNEL_SETTINGS_COMMANDS = [
     "Edit Channel", "Delete Channel", "Back"
 ]
 
-# --- Rest of the bot functions (task_timer, show_task_list, etc.) are kept for /start task_ links ---
-# They are unchanged from your previous code, but we remove the user commands for "📋 Task", "TG Task", "Media Task"
-# The handler for those commands is removed below.
-
+# --- Rest of the bot functions ---
 async def get_now():
     tz = pytz.timezone('Asia/Dhaka')
     return datetime.now(tz).strftime("%d/%m/%Y %I:%M %p")
@@ -553,7 +550,6 @@ async def grant_milestone_bonuses(user_id, sets):
     except:
         pass
 
-# The following task functions are kept for the /start task_ links and for admin task creation
 async def task_timer(user_id, task_id, message_id, chat_id, required_time):
     await asyncio.sleep(required_time)
     try:
@@ -2518,12 +2514,13 @@ async def callback(event):
             except:
                 pass
             del task_list_msgs[user_id]
-        await event.respond("🔙 Back to main menu.", buttons=main_buttons)
+        # ফিক্স: event.respond → event.edit
+        await event.edit("🔙 Back to main menu.", buttons=main_buttons)
         return
 
     if data == "task_back":
         if user_id not in task_sessions:
-            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
+            await event.edit("🔙 Back to main menu.", buttons=main_buttons)
             return
 
         session = task_sessions[user_id]
@@ -2538,7 +2535,7 @@ async def callback(event):
             del task_sessions[user_id]
             if user_id in screenshot_waiting:
                 del screenshot_waiting[user_id]
-            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
+            await event.edit("🔙 Back to main menu.", buttons=main_buttons)
         elif screen == 'timer':
             await render_task_details(user_id, chat_id, msg_id)
         elif screen == 'timesup':
@@ -2548,7 +2545,7 @@ async def callback(event):
                 del screenshot_waiting[user_id]
             await render_task_details(user_id, chat_id, msg_id)
         else:
-            await event.respond("🔙 Back to main menu.", buttons=main_buttons)
+            await event.edit("🔙 Back to main menu.", buttons=main_buttons)
         return
 
     if data.startswith("start_task_"):
