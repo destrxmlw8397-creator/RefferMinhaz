@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Earn Tasks</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Telegram Web App SDK -->
+    <script src="https://telegram.org/js/telegram-web-app.js?56"></script>
+    <style>
+        body {
+            background: #1a1a2e;
+            color: #eee;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 16px;
+            margin: 0;
+        }
+        .task-card {
+            background: #16213e;
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            transition: 0.2s;
+        }
+        .task-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .task-reward {
+            color: #fbbf24;
+            font-weight: 500;
+        }
+        .btn {
+            border: none;
+            border-radius: 40px;
+            padding: 10px 20px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: 0.2s;
+            min-width: 100px;
+        }
+        .btn-start {
+            background: #3b82f6;
+            color: white;
+        }
+        .btn-start:hover {
+            background: #2563eb;
+        }
+        .btn-verify {
+            background: #f59e0b;
+            color: #1a1a2e;
+        }
+        .btn-verify:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .btn-claimed {
+            background: #22c55e;
+            color: white;
+            cursor: default;
+        }
+        .btn-claimed:disabled {
+            opacity: 0.8;
+        }
+        .timer-text {
+            font-size: 14px;
+            color: #94a3b8;
+            margin-top: 4px;
+        }
+        .loading-spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3b82f6;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="max-w-md mx-auto">
+        <h1 class="text-2xl font-bold mb-4 text-center text-white">🎯 Earn Tasks</h1>
+        <div id="taskList"></div>
+        <div id="loading" class="text-center py-8 text-gray-400">Loading tasks...</div>
+    </div>
+
+    <script>
+        // Telegram Web App init
+        const tg = window.Telegram.WebApp;
+        tg.expand(); // full screen
+
+        // ----- Global state -----
+        let tasks = [];
+        let userId = null;
+        let initData = tg.initData || '';
+
+        // ----- DOM refs -----
+        const taskListEl = document.getElementById('taskList');
+        const loadingEl = document.getElementById('loading');
+
+        // ----- API calls -----
+        async function fetchTasks() {
+            try {
+                const resp = await fetch(`/api/tasks?init_data=${encodeURIComponent(initData)}`);
+                if (!resp.ok) throw new Error('Failed to fetch tasks');
+                const data = await resp.json();
+                return data.tasks || [];
+            } catch (err) {
+                console.error(err);
+                return [];
+            }
+        }
+
+        async function verifyTask(taskId) {
+            try {
+                const resp = await fetch('/api/verify-task', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_id: taskId, init_data: initData })
+                });
+                const result = await resp.json();
+                return result;
+            } catch (err) {
+                console.error(err);
+                return { status: 'error', message: err.message };
+            }
+        }
+
+        // ----- Render tasks -----
+        function renderTasks(tasks) {
+            if (tasks.length === 0) {
+                taskListEl.innerHTML = `<p class="text-center text-gray-400">No tasks available right now.</p>`;
+                return;
+            }
+
+            let html = '';
+            tasks.forEach(task => {
+                const status = task.status; // 'available', 'pending', 'claimed'
+                let buttonHtml = '';
+                let timerHtml = '';
+
+                if (status === 'available') {
+                    buttonHtml = `<button class="btn btn-start" data-task-id="${task.id}" data-action="start">Start</button>`;
+                } else if (status === 'pending') {
+                    // পেন্ডিং – আমরা বাটনে Verify দেখাব, কিন্তু টাইমার চলবে
+                    buttonHtml = `<button class="btn btn-verify" data-task-id="${task.id}" data-action="verify" disabled>Verify</button>`;
+                    timerHtml = `<div class="timer-text" id="timer-${task.id}">⏳ Please wait 30s</div>`;
+                } else if (status === 'claimed') {
+                    buttonHtml = `<button class="btn btn-claimed" disabled>✅ Claimed</button>`;
+                }
+
+                html += `
+                    <div class="task-card" data-task-id="${task.id}">
+                        <div class="task-title">${task.title}</div>
+                        <div class="task-reward">💰 ${task.reward} TRX</div>
+                        <div class="flex justify-between items-center mt-3">
+                            ${buttonHtml}
+                            ${timerHtml}
+                        </div>
+                    </div>
+                `;
+            });
+
+            taskListEl.innerHTML = html;
+
+            // ইভেন্ট লিসেনার – Start বাটন
+            document.querySelectorAll('button[data-action="start"]').forEach(btn => {
+                btn.addEventListener('click', async function(e) {
+                    const taskId = parseInt(this.dataset.taskId);
+                    // বাটন ডিজেবল করে Verify স্টেটে নেওয়া
+                    this.disabled = true;
+                    this.textContent = '⏳ Starting...';
+                    // ব্যাকএন্ডে স্টার্ট রিকোয়েস্ট (পেন্ডিং তৈরি)
+                    const result = await verifyTask(taskId);
+                    if (result.status === 'pending') {
+                        // পেন্ডিং স্টেট – বাটন পরিবর্তন করে টাইমার চালু
+                        this.textContent = 'Verify';
+                        this.className = 'btn btn-verify';
+                        this.dataset.action = 'verify';
+                        this.disabled = true;
+
+                        // টাইমার এলিমেন্ট তৈরি
+                        const card = this.closest('.task-card');
+                        let timerDiv = card.querySelector('.timer-text');
+                        if (!timerDiv) {
+                            timerDiv = document.createElement('div');
+                            timerDiv.className = 'timer-text';
+                            timerDiv.id = `timer-${taskId}`;
+                            card.querySelector('.flex').appendChild(timerDiv);
+                        }
+                        // ৩০ সেকেন্ড কাউন্টডাউন
+                        let remaining = 30;
+                        timerDiv.textContent = `⏳ Please wait ${remaining}s`;
+
+                        const interval = setInterval(async () => {
+                            remaining--;
+                            if (remaining <= 0) {
+                                clearInterval(interval);
+                                timerDiv.textContent = `✅ You can now Verify!`;
+                                // বাটন এনেবল করে দিন
+                                const btn2 = card.querySelector('button[data-action="verify"]');
+                                if (btn2) {
+                                    btn2.disabled = false;
+                                    btn2.textContent = 'Verify';
+                                    // ক্লিক হ্যান্ডেলার
+                                    btn2.onclick = async function() {
+                                        this.disabled = true;
+                                        this.textContent = 'Verifying...';
+                                        const result2 = await verifyTask(taskId);
+                                        if (result2.status === 'success') {
+                                            this.textContent = `✅ +${result2.reward} TRX`;
+                                            this.className = 'btn btn-claimed';
+                                            this.disabled = true;
+                                            timerDiv.textContent = '🎉 Claimed!';
+                                        } else {
+                                            this.textContent = 'Retry';
+                                            this.disabled = false;
+                                            alert(result2.message || 'Verification failed');
+                                        }
+                                    };
+                                }
+                            } else {
+                                timerDiv.textContent = `⏳ Please wait ${remaining}s`;
+                            }
+                        }, 1000);
+
+                    } else if (result.status === 'success') {
+                        // সরাসরি সফল (হয়তো টাইমার লাগেনি)
+                        this.textContent = `✅ +${result.reward} TRX`;
+                        this.className = 'btn btn-claimed';
+                        this.disabled = true;
+                    } else {
+                        this.textContent = 'Start';
+                        this.disabled = false;
+                        alert(result.message || 'Something went wrong');
+                    }
+                });
+            });
+        }
+
+        // ----- Main init -----
+        async function init() {
+            // ইউজার ডেটা বের করি
+            if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+                userId = tg.initDataUnsafe.user.id;
+            }
+
+            const taskData = await fetchTasks();
+            tasks = taskData;
+            loadingEl.style.display = 'none';
+            renderTasks(tasks);
+        }
+
+        init();
+    </script>
+</body>
+</html>
