@@ -3049,81 +3049,55 @@ async def callback(event):
             )
 
         settings = await get_settings()
-        currency = settings.get('currency', 'TRX')
+        currency = settings.get('currency', 'BDT')
 
-        # Helper to get prize for a given rank (only if refs > 0)
-        def get_prize(rank, refs):
-            if refs <= 0:
-                return 0
-            if rank == 1:
-                return 5000
-            elif rank == 2:
-                return 3000
-            elif rank == 3:
-                return 2000
-            elif 4 <= rank <= 10:
-                return 1500
-            elif 11 <= rank <= 20:
-                return 1000
-            elif 21 <= rank <= 25:
-                return 500
-            return 0
+        # Helper to get ordinal suffix
+        def ordinal(n):
+            if 11 <= n % 100 <= 13:
+                return f"{n}th"
+            return {1: f"{n}st", 2: f"{n}nd", 3: f"{n}rd"}.get(n % 10, f"{n}th")
 
-        # Determine which tiers have at least one user with refs > 0
-        has_refs = {}
-        # 1st tier always exists if top_users has at least 1
-        if len(top_users) > 0 and top_users[0]['total_ref'] > 0:
-            has_refs['1st'] = True
-        else:
-            has_refs['1st'] = False
+        # Group users by total_ref, preserving order
+        groups = []
+        if top_users:
+            current_ref = top_users[0]['total_ref']
+            current_group = [top_users[0]]
+            for user in top_users[1:]:
+                if user['total_ref'] == current_ref:
+                    current_group.append(user)
+                else:
+                    groups.append((current_ref, current_group))
+                    current_ref = user['total_ref']
+                    current_group = [user]
+            groups.append((current_ref, current_group))
 
-        # Check 2nd
-        if len(top_users) > 1 and top_users[1]['total_ref'] > 0:
-            has_refs['2nd'] = True
-        else:
-            has_refs['2nd'] = False
-
-        # Check 3rd
-        if len(top_users) > 2 and top_users[2]['total_ref'] > 0:
-            has_refs['3rd'] = True
-        else:
-            has_refs['3rd'] = False
-
-        # Check 4-10
-        has_refs['4-10'] = any((row['total_ref'] or 0) > 0 for row in top_users[3:10])
-
-        # Check 11-20
-        has_refs['11-20'] = any((row['total_ref'] or 0) > 0 for row in top_users[10:20])
-
-        # Check 21-25
-        has_refs['21-25'] = any((row['total_ref'] or 0) > 0 for row in top_users[20:25])
+        # Assign ranks to each group
+        start_rank = 1
+        for ref_count, group in groups:
+            end_rank = start_rank + len(group) - 1
+            group_info = {
+                'ref_count': ref_count,
+                'users': group,
+                'start': start_rank,
+                'end': end_rank
+            }
+            # Replace the group with a dict
+            groups[groups.index((ref_count, group))] = group_info
+            start_rank = end_rank + 1
 
         # Build the prize pool summary
         summary_lines = []
-
-        # 1st place: show total_ref of 1st if any, else 0
-        if len(top_users) > 0:
-            first_refs = top_users[0]['total_ref'] or 0
-            summary_lines.append(f"🥇 1st — {first_refs:,} {currency} 🪙")
-        else:
-            summary_lines.append("🥇 1st — 0 TRX 🪙")
-
-        # If only 1st has refs and all others have 0, show combined line
-        others_have_refs = any(has_refs[tier] for tier in ['2nd', '3rd', '4-10', '11-20', '21-25'])
-        if not others_have_refs:
-            summary_lines.append("2nd–25th — 0 TRX 🪙")
-        else:
-            # Add lines for tiers that have at least one user with refs > 0
-            if has_refs['2nd']:
-                summary_lines.append("🥈 2nd — 3,000 TRX 🪙")
-            if has_refs['3rd']:
-                summary_lines.append("🥉 3rd — 2,000 TRX 🪙")
-            if has_refs['4-10']:
-                summary_lines.append("4th–10th — 1,500 TRX 🪙")
-            if has_refs['11-20']:
-                summary_lines.append("11th–20th — 1,000 TRX 🪙")
-            if has_refs['21-25']:
-                summary_lines.append("21st–25th — 500 TRX 🪙")
+        for group in groups:
+            ref_count = group['ref_count']
+            prize = ref_count * 10  # prize = 10 per referral
+            start = group['start']
+            end = group['end']
+            if start == end:
+                rank_str = ordinal(start)
+                summary_lines.append(f"{rank_str} — {prize} {currency} 🪙")
+            else:
+                rank_str = f"{ordinal(start)}–{ordinal(end)}"
+                summary_lines.append(f"{rank_str} — {prize} {currency} 🪙")
 
         # Build the main message
         msg = "🏆 **Top 25 Referral Leaders**\n"
@@ -3131,7 +3105,7 @@ async def callback(event):
         msg += "\n".join(summary_lines)
         msg += "\n━━━━━━━━━━━━━━━━\n\n"
 
-        # Generate user list
+        # Generate user list (each user individually)
         if not top_users:
             msg += "No referral data available yet."
         else:
@@ -3139,6 +3113,7 @@ async def callback(event):
                 name = row['name'] or "Unknown"
                 username = row['username']
                 refs = row['total_ref'] or 0
+                prize = refs * 10  # same calculation
 
                 # Display name: username if available, else name
                 if username and username != "No Username":
@@ -3156,11 +3131,7 @@ async def callback(event):
                 else:
                     rank_str = f"{idx}."
 
-                # Prize logic: only if refs > 0 then get prize, else 0
-                prize = get_prize(idx, refs)
-                prize_str = f"{prize:,} {currency}" if prize > 0 else f"0 {currency}"
-
-                msg += f"{rank_str} {display} — {refs} refs · {prize_str} 🪙\n"
+                msg += f"{rank_str} {display} — {refs} refs · {prize} {currency} 🪙\n"
 
         msg += "\n📊 Rankings update in real-time. Keep inviting to climb the leaderboard! 🚀"
 
