@@ -7,98 +7,20 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://telegram.org/js/telegram-web-app.js?56"></script>
     <style>
-        body {
-            background: #0f0f1a;
-            color: #e4e4f0;
-            font-family: 'Inter', -apple-system, sans-serif;
-            padding: 16px;
-            margin: 0;
-        }
-        .task-card {
-            background: #1a1a2e;
-            border-radius: 20px;
-            padding: 18px 16px;
-            margin-bottom: 14px;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
-            transition: 0.2s;
-            border: 1px solid #2a2a44;
-        }
-        .task-title {
-            font-size: 17px;
-            font-weight: 600;
-            letter-spacing: -0.2px;
-        }
-        .task-reward {
-            color: #fbbf24;
-            font-weight: 600;
-            background: #2a2a44;
-            padding: 2px 12px;
-            border-radius: 30px;
-            font-size: 14px;
-            display: inline-block;
-        }
-        .btn {
-            border: none;
-            border-radius: 40px;
-            padding: 10px 24px;
-            font-weight: 600;
-            font-size: 14px;
-            cursor: pointer;
-            transition: 0.15s;
-            min-width: 100px;
-            letter-spacing: 0.3px;
-        }
-        .btn-start {
-            background: #3b82f6;
-            color: white;
-        }
-        .btn-start:active { transform: scale(0.96); }
-        .btn-verify {
-            background: #f59e0b;
-            color: #0f0f1a;
-        }
-        .btn-verify:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-        .btn-claimed {
-            background: #22c55e;
-            color: white;
-            cursor: default;
-            opacity: 0.8;
-        }
-        .btn-claimed:disabled { opacity: 0.9; }
-        .timer-text {
-            font-size: 13px;
-            color: #94a3b8;
-            margin-top: 6px;
-        }
-        .spinner {
-            display: inline-block;
-            width: 18px;
-            height: 18px;
-            border: 3px solid rgba(255,255,255,0.3);
-            border-top-color: #fff;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            vertical-align: middle;
-            margin-right: 6px;
-        }
+        body { background: #0f0f1a; color: #e4e4f0; font-family: 'Inter', sans-serif; padding: 16px; margin: 0; }
+        .task-card { background: #1a1a2e; border-radius: 20px; padding: 18px 16px; margin-bottom: 14px; border: 1px solid #2a2a44; }
+        .task-title { font-size: 17px; font-weight: 600; }
+        .task-reward { color: #fbbf24; background: #2a2a44; padding: 2px 12px; border-radius: 30px; font-size: 14px; display: inline-block; }
+        .btn { border: none; border-radius: 40px; padding: 10px 24px; font-weight: 600; font-size: 14px; cursor: pointer; transition: 0.15s; min-width: 100px; }
+        .btn-start { background: #3b82f6; color: white; }
+        .btn-verify { background: #f59e0b; color: #0f0f1a; }
+        .btn-verify:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-claimed { background: #22c55e; color: white; cursor: default; opacity: 0.8; }
+        .timer-text { font-size: 13px; color: #94a3b8; margin-top: 6px; }
+        .spinner { display: inline-block; width: 18px; height: 18px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 20px;
-        }
-        .balance-badge {
-            background: #2a2a44;
-            padding: 6px 16px;
-            border-radius: 40px;
-            font-size: 15px;
-            font-weight: 500;
-        }
+        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+        .balance-badge { background: #2a2a44; padding: 6px 16px; border-radius: 40px; font-size: 15px; font-weight: 500; }
         .balance-badge span { color: #fbbf24; }
     </style>
 </head>
@@ -116,16 +38,10 @@
         const tg = window.Telegram.WebApp;
         tg.expand();
         const initData = tg.initData || '';
-        let userId = null;
-        if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-            userId = tg.initDataUnsafe.user.id;
-        }
-
         const taskListEl = document.getElementById('taskList');
         const loadingEl = document.getElementById('loading');
         const balanceEl = document.getElementById('userBalance');
 
-        // ----- API helpers -----
         async function fetchTasks() {
             const resp = await fetch(`/api/tasks?init_data=${encodeURIComponent(initData)}`);
             if (!resp.ok) throw new Error('Failed to fetch');
@@ -141,7 +57,6 @@
             return await resp.json();
         }
 
-        // ----- Render -----
         function renderTasks(data) {
             const tasks = data.tasks || [];
             const balance = data.balance || 0;
@@ -154,9 +69,8 @@
 
             let html = '';
             tasks.forEach(task => {
-                const status = task.status; // 'available' | 'pending' | 'claimed'
-                let btnHtml = '';
-                let timerHtml = '';
+                const status = task.status;
+                let btnHtml = '', timerHtml = '';
 
                 if (status === 'available') {
                     btnHtml = `<button class="btn btn-start" data-task-id="${task.id}" data-action="start">▶ Start</button>`;
@@ -185,7 +99,6 @@
 
             taskListEl.innerHTML = html;
 
-            // ---- Event: Start ----
             document.querySelectorAll('button[data-action="start"]').forEach(btn => {
                 btn.addEventListener('click', async function() {
                     const taskId = parseInt(this.dataset.taskId);
@@ -194,13 +107,11 @@
 
                     const result = await verifyTask(taskId);
                     if (result.status === 'pending') {
-                        // বাটন পরিবর্তন
                         this.textContent = '⏳ Verify';
                         this.className = 'btn btn-verify';
                         this.dataset.action = 'verify';
                         this.disabled = true;
 
-                        // টাইমার শুরু
                         const card = this.closest('.task-card');
                         let timerDiv = card.querySelector('.timer-text');
                         if (!timerDiv) {
@@ -230,7 +141,6 @@
                                             this.className = 'btn btn-claimed';
                                             this.disabled = true;
                                             timerDiv.textContent = '🎉 Claimed!';
-                                            // ব্যালেন্স আপডেট
                                             balanceEl.textContent = (parseFloat(balanceEl.textContent) + res.reward).toFixed(1);
                                         } else {
                                             this.textContent = 'Retry';
@@ -258,7 +168,6 @@
             });
         }
 
-        // ----- Init -----
         async function init() {
             try {
                 const data = await fetchTasks();
@@ -269,7 +178,6 @@
                 console.error(e);
             }
         }
-
         init();
     </script>
 </body>
