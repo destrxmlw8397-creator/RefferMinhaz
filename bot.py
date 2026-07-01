@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 from datetime import datetime, timedelta
 import pytz
 from telethon import TelegramClient, events, Button
+from telethon.sessions import StringSession   # ✅ StringSession ইমপোর্ট
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.errors import UserNotParticipantError
 from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
@@ -20,11 +21,19 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MAIN_ADMIN_ID = int(os.environ.get("MAIN_ADMIN_ID", 0))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", None)   # ✅ StringSession
+APP_URL = os.environ.get("APP_URL", "https://your-domain.com")  # Mini App URL
 
 if not all([API_ID, API_HASH, BOT_TOKEN, MAIN_ADMIN_ID, DATABASE_URL]):
     raise ValueError("Missing required environment variables: API_ID, API_HASH, BOT_TOKEN, MAIN_ADMIN_ID, DATABASE_URL")
 
-client = TelegramClient('referral_bot', API_ID, API_HASH)
+# --- Telegram Client ---
+if SESSION_STRING:
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    print("✅ Using persistent StringSession")
+else:
+    client = TelegramClient('referral_bot', API_ID, API_HASH)
+    print("⚠️ No SESSION_STRING found, using temporary session file")
 
 waiting_users = {}          # user_id -> state (e.g., 'set_wallet', 'confirm_wallet', 'withdraw_amount', 'change_wallet', 'show_wallet')
 admin_waiting = {}
@@ -829,12 +838,15 @@ async def admin_panel(event):
 @client.on(events.NewMessage(pattern='/earn'))
 async def earn_command(event):
     """Open the Earn Tasks Mini App"""
-    # Get the base URL from environment or use default
-    base_url = os.environ.get("APP_URL", "https://your-domain.com")
+    base_url = APP_URL  # from environment
+    # Fallback if webview not available (Telethon version < 1.28)
+    if hasattr(Button, 'webview'):
+        btn = Button.webview("🚀 Open Earn Page", base_url)
+    else:
+        btn = Button.url("🚀 Open Earn Page", base_url)
     await event.respond(
-        "📋 **Earn Tasks**\n\n"
-        "Complete tasks and earn rewards! 🎁",
-        buttons=[[Button.webview("🚀 Open Earn Page", base_url)]]
+        "📋 **Earn Tasks**\n\nComplete tasks and earn rewards! 🎁",
+        buttons=[[btn]]
     )
 
 # --- TEXT HANDLER ---
@@ -3193,7 +3205,6 @@ async def callback(event):
 # --- Web server with Mini App routes ---
 async def serve_index(request):
     """Serve the Mini App HTML"""
-    # Check if static folder exists
     static_path = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
     if os.path.exists(static_path):
         with open(static_path, 'r', encoding='utf-8') as f:
