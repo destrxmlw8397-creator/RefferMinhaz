@@ -14,7 +14,7 @@ app = FastAPI()
 # CORS (শুধু আপনার ডোমেইনের জন্য)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://yourdomain.com"],  # আপনার ডোমেইন বসান
+    allow_origins=["https://refferminhaz.onrender.com"],  # আপনার ডোমেইন বসান
     allow_methods=["*"],
     allow_headers=["*"],
 )
