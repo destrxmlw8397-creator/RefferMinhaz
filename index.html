@@ -17,11 +17,10 @@
         .btn-verify:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-claimed { background: #22c55e; color: white; cursor: default; opacity: 0.8; }
         .timer-text { font-size: 13px; color: #94a3b8; margin-top: 6px; }
-        .spinner { display: inline-block; width: 18px; height: 18px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
-        @keyframes spin { to { transform: rotate(360deg); } }
         .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
         .balance-badge { background: #2a2a44; padding: 6px 16px; border-radius: 40px; font-size: 15px; font-weight: 500; }
         .balance-badge span { color: #fbbf24; }
+        #debug { background: #1a1a2e; padding: 10px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; color: #94a3b8; border: 1px solid #2a2a44; display: none; }
     </style>
 </head>
 <body>
@@ -30,6 +29,7 @@
             <h1 class="text-2xl font-bold">🎯 Earn</h1>
             <div class="balance-badge">💰 <span id="userBalance">0</span> TRX</div>
         </div>
+        <div id="debug"></div>
         <div id="taskList"></div>
         <div id="loading" class="text-center py-10 text-gray-400">⏳ Loading tasks...</div>
     </div>
@@ -37,14 +37,32 @@
     <script>
         const tg = window.Telegram.WebApp;
         tg.expand();
+        tg.ready(); // গুরুত্বপূর্ণ: WebApp লোড হওয়ার সংকেত দিন
+
+        const debugEl = document.getElementById('debug');
         const initData = tg.initData || '';
+
+        // ডিবাগ তথ্য দেখান
+        debugEl.style.display = 'block';
+        if (initData) {
+            debugEl.innerHTML = `✅ InitData received (length: ${initData.length})`;
+            debugEl.style.borderColor = '#22c55e';
+        } else {
+            debugEl.innerHTML = `❌ No initData! Make sure:<br>
+                1. BotFather has set domain: <code>/setdomain</code> → <code>https://refferminhaz.onrender.com</code><br>
+                2. Open this page only from Telegram (not browser directly)`;
+            debugEl.style.borderColor = '#ef4444';
+            document.getElementById('loading').innerHTML = '❌ Cannot load tasks. Please open from Telegram.';
+            throw new Error('No initData');
+        }
+
         const taskListEl = document.getElementById('taskList');
         const loadingEl = document.getElementById('loading');
         const balanceEl = document.getElementById('userBalance');
 
         async function fetchTasks() {
             const resp = await fetch(`/api/tasks?init_data=${encodeURIComponent(initData)}`);
-            if (!resp.ok) throw new Error('Failed to fetch');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
             return await resp.json();
         }
 
@@ -174,7 +192,7 @@
                 loadingEl.style.display = 'none';
                 renderTasks(data);
             } catch (e) {
-                loadingEl.textContent = '❌ Failed to load tasks. Please try again.';
+                loadingEl.innerHTML = `❌ Failed to load tasks: ${e.message}`;
                 console.error(e);
             }
         }
