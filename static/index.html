@@ -101,7 +101,6 @@
             if (window.Telegram && window.Telegram.WebApp) {
                 return window.Telegram.WebApp.initData;
             }
-            // Fallback for local testing (set dummy)
             return 'query_id=...&user=%7B%22id%22%3A123456%2C%22first_name%22%3A%22Test%22%7D&auth_date=...&hash=...';
         }
 
@@ -168,7 +167,6 @@
             btn.innerHTML = '<span class="spinner"></span> Verifying...';
 
             try {
-                // Simulate 5-second verification (you can customize)
                 await new Promise(resolve => setTimeout(resolve, 5000));
                 const result = await verifyTask(taskId);
                 if (result.success) {
