@@ -3040,75 +3040,138 @@ async def callback(event):
         await event.edit(msg, buttons=[Button.inline("🔙 Back", b"back_inv")])
         return
 
+    # --- DYNAMIC TOP LIST / LEADERBOARD HANDLER ---
     if data == "top_list":
-        settings = await get_settings()
-        currency = settings['currency']
-        # Get top 25 users by total_ref descending
+        # Fetch top 25 users by total_ref descending
         async with db_pool.acquire() as conn:
-            tops = await conn.fetch("SELECT user_id, name, username, total_ref, total_earned FROM users ORDER BY total_ref DESC LIMIT 25")
-        if not tops:
-            await event.edit("❌ No users found.", buttons=[Button.inline("🔙 Back", b"back_inv")])
-            return
+            top_users = await conn.fetch(
+                "SELECT name, username, total_ref FROM users ORDER BY total_ref DESC LIMIT 25"
+            )
 
-        # Prize pool header
-        header = f"🏆 Top 25 Referral Leaders\n\n💰 {currency} Prize Pool\n\n"
-        header += "🥇 1st — 5,000 TRX 🪙\n"
-        header += "🥈 2nd — 3,000 TRX 🪙\n"
-        header += "🥉 3rd — 2,000 TRX 🪙\n"
-        header += "4th–10th — 1,500 TRX 🪙\n"
-        header += "11th–20th — 1,000 TRX 🪙\n"
-        header += "21st–25th — 500 TRX 🪙\n"
-        header += "━━━━━━━━━━━━━━━━\n\n"
+        settings = await get_settings()
+        currency = settings.get('currency', 'TRX')
 
-        # Prize tiers
-        prize_tiers = {
-            (1, 1): 5000,
-            (2, 2): 3000,
-            (3, 3): 2000,
-            (4, 10): 1500,
-            (11, 20): 1000,
-            (21, 25): 500
-        }
+        # Helper to get prize for a given rank (only if refs > 0)
+        def get_prize(rank, refs):
+            if refs <= 0:
+                return 0
+            if rank == 1:
+                return 5000
+            elif rank == 2:
+                return 3000
+            elif rank == 3:
+                return 2000
+            elif 4 <= rank <= 10:
+                return 1500
+            elif 11 <= rank <= 20:
+                return 1000
+            elif 21 <= rank <= 25:
+                return 500
+            return 0
 
-        lines = []
-        for i, row in enumerate(tops, start=1):
-            user_id = row['user_id']
-            name = row['name']
-            username = row['username']
-            total_ref = row['total_ref']
-            total_earned = row['total_earned']
+        # Determine which tiers have at least one user with refs > 0
+        has_refs = {}
+        # 1st tier always exists if top_users has at least 1
+        if len(top_users) > 0 and top_users[0]['total_ref'] > 0:
+            has_refs['1st'] = True
+        else:
+            has_refs['1st'] = False
 
-            # Determine display name
-            if username and username != "No Username":
-                display = f"@{username}"
-            elif name and name != "Unknown":
-                display = name
-            else:
-                display = str(user_id)
+        # Check 2nd
+        if len(top_users) > 1 and top_users[1]['total_ref'] > 0:
+            has_refs['2nd'] = True
+        else:
+            has_refs['2nd'] = False
 
-            # Determine prize
-            prize = 0
-            for (lo, hi), amount in prize_tiers.items():
-                if lo <= i <= hi:
-                    prize = amount
-                    break
+        # Check 3rd
+        if len(top_users) > 2 and top_users[2]['total_ref'] > 0:
+            has_refs['3rd'] = True
+        else:
+            has_refs['3rd'] = False
 
-            # Rank display
-            if i == 1:
-                rank_str = "🥇"
-            elif i == 2:
-                rank_str = "🥈"
-            elif i == 3:
-                rank_str = "🥉"
-            else:
-                rank_str = f"{i}."
+        # Check 4-10
+        has_refs['4-10'] = any((row['total_ref'] or 0) > 0 for row in top_users[3:10])
 
-            # Format prize with comma separators
-            prize_str = f"{prize:,} {currency}"
-            lines.append(f"{rank_str} {display} — {total_ref} refs · {prize_str} 🪙")
+        # Check 11-20
+        has_refs['11-20'] = any((row['total_ref'] or 0) > 0 for row in top_users[10:20])
 
-        top_msg = header + "\n".join(lines) + "\n\n📊 Rankings update in real-time. Keep inviting to climb the leaderboard! 🚀"
-        await event.edit(top_msg, buttons=[Button.inline("🔙 Back", b"back_inv")])
+        # Check 21-25
+        has_refs['21-25'] = any((row['total_ref'] or 0) > 0 for row in top_users[20:25])
+
+        # Build the prize pool summary
+        summary_lines = []
+
+        # 1st place: show total_ref of 1st if any, else 0
+        if len(top_users) > 0:
+            first_refs = top_users[0]['total_ref'] or 0
+            summary_lines.append(f"🥇 1st — {first_refs:,} {currency} 🪙")
+        else:
+            summary_lines.append("🥇 1st — 0 TRX 🪙")
+
+        # If only 1st has refs and all others have 0, show combined line
+        others_have_refs = any(has_refs[tier] for tier in ['2nd', '3rd', '4-10', '11-20', '21-25'])
+        if not others_have_refs:
+            summary_lines.append("2nd–25th — 0 TRX 🪙")
+        else:
+            # Add lines for tiers that have at least one user with refs > 0
+            if has_refs['2nd']:
+                summary_lines.append("🥈 2nd — 3,000 TRX 🪙")
+            if has_refs['3rd']:
+                summary_lines.append("🥉 3rd — 2,000 TRX 🪙")
+            if has_refs['4-10']:
+                summary_lines.append("4th–10th — 1,500 TRX 🪙")
+            if has_refs['11-20']:
+                summary_lines.append("11th–20th — 1,000 TRX 🪙")
+            if has_refs['21-25']:
+                summary_lines.append("21st–25th — 500 TRX 🪙")
+
+        # Build the main message
+        msg = "🏆 **Top 25 Referral Leaders**\n"
+        msg += f"💰 **{currency} Prize Pool**\n"
+        msg += "\n".join(summary_lines)
+        msg += "\n━━━━━━━━━━━━━━━━\n\n"
+
+        # Generate user list
+        if not top_users:
+            msg += "No referral data available yet."
+        else:
+            for idx, row in enumerate(top_users, start=1):
+                name = row['name'] or "Unknown"
+                username = row['username']
+                refs = row['total_ref'] or 0
+
+                # Display name: username if available, else name
+                if username and username != "No Username":
+                    display = f"@{username}"
+                else:
+                    display = name
+
+                # Rank indicator
+                if idx == 1:
+                    rank_str = "🥇"
+                elif idx == 2:
+                    rank_str = "🥈"
+                elif idx == 3:
+                    rank_str = "🥉"
+                else:
+                    rank_str = f"{idx}."
+
+                # Prize logic: only if refs > 0 then get prize, else 0
+                prize = get_prize(idx, refs)
+                prize_str = f"{prize:,} {currency}" if prize > 0 else f"0 {currency}"
+
+                msg += f"{rank_str} {display} — {refs} refs · {prize_str} 🪙\n"
+
+        msg += "\n📊 Rankings update in real-time. Keep inviting to climb the leaderboard! 🚀"
+
+        # Back button
+        kb = [[Button.inline("🔙 Back", b"back_inv")]]
+
+        try:
+            await event.edit(msg, buttons=kb)
+        except Exception as e:
+            await event.respond(msg, buttons=kb)
+        await event.answer()
         return
 
     if data == "back_inv":
