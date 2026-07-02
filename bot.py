@@ -94,11 +94,16 @@ def verify_init_data(init_data: str) -> dict:
     sorted_keys = sorted(parsed.keys())
     data_check_string = '\n'.join([f"{k}={parsed[k]}" for k in sorted_keys])
 
+    # Debug prints
+    print(f"🔍 data_check_string: {data_check_string}")
+    print(f"🔍 keys: {sorted_keys}")
+
     secret = hashlib.sha256(BOT_TOKEN.encode()).digest()
     expected_hash = hmac.new(secret, data_check_string.encode(), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_hash, received_hash):
         print(f"❌ Hash mismatch!\nExpected: {expected_hash}\nReceived: {received_hash}")
+        print(f"🔍 BOT_TOKEN (first 5 chars): {BOT_TOKEN[:5]}...")
         return None
 
     print("✅ Hash verified successfully")
@@ -820,20 +825,26 @@ async def auto_approve_pending_submissions():
             print(f"Error in auto_approve_pending_submissions: {e}")
         await asyncio.sleep(300)
 
+# FIXED weekly_release: now() instead of now
 async def weekly_release():
     while True:
         try:
             now = int(time.time())
             one_week_seconds = 7 * 24 * 3600
             async with db_pool.acquire() as conn:
-                rows = await conn.fetch("SELECT user_id, hold_balance FROM users WHERE hold_balance > 0 AND (last_release_time = 0 OR now - last_release_time >= $1)", one_week_seconds)
+                rows = await conn.fetch(
+                    "SELECT user_id, hold_balance FROM users WHERE hold_balance > 0 AND (last_release_time = 0 OR now() - last_release_time >= $1)",
+                    one_week_seconds
+                )
                 for row in rows:
                     user_id = row['user_id']
                     hold_amount = row['hold_balance']
                     if hold_amount <= 0:
                         continue
-                    await conn.execute("UPDATE users SET balance = balance + $1, hold_balance = 0, total_released = total_released + $1, last_release_time = $2 WHERE user_id = $3",
-                                       hold_amount, now, user_id)
+                    await conn.execute(
+                        "UPDATE users SET balance = balance + $1, hold_balance = 0, total_released = total_released + $1, last_release_time = $2 WHERE user_id = $3",
+                        hold_amount, now, user_id
+                    )
                     currency = (await get_settings())['currency']
                     try:
                         await client.send_message(user_id, f"🔓 **Weekly Release!**\n\nYour hold balance of **{hold_amount:.2f} {currency}** has been released to your real balance. You can now withdraw it.")
