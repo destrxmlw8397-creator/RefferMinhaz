@@ -104,6 +104,7 @@ def verify_init_data(init_data: str) -> dict:
     if not hmac.compare_digest(expected_hash, received_hash):
         print(f"❌ Hash mismatch!\nExpected: {expected_hash}\nReceived: {received_hash}")
         print(f"🔍 BOT_TOKEN (first 5 chars): {BOT_TOKEN[:5]}...")
+        print(f"🔍 BOT_TOKEN length: {len(BOT_TOKEN)}")
         return None
 
     print("✅ Hash verified successfully")
@@ -825,7 +826,7 @@ async def auto_approve_pending_submissions():
             print(f"Error in auto_approve_pending_submissions: {e}")
         await asyncio.sleep(300)
 
-# FIXED weekly_release: now() instead of now
+# FIXED: weekly_release with proper type casting
 async def weekly_release():
     while True:
         try:
@@ -833,7 +834,7 @@ async def weekly_release():
             one_week_seconds = 7 * 24 * 3600
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT user_id, hold_balance FROM users WHERE hold_balance > 0 AND (last_release_time = 0 OR now() - last_release_time >= $1)",
+                    "SELECT user_id, hold_balance FROM users WHERE hold_balance > 0 AND (last_release_time = 0 OR EXTRACT(EPOCH FROM now() - to_timestamp(last_release_time)) >= $1)",
                     one_week_seconds
                 )
                 for row in rows:
@@ -2552,7 +2553,6 @@ async def callback(event):
             except:
                 pass
             del task_list_msgs[user_id]
-        # FIX: use event.edit instead of event.respond
         await event.edit("🔙 Back to main menu.", buttons=main_buttons)
         return
 
