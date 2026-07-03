@@ -7,27 +7,120 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://telegram.org/js/telegram-web-app.js?56"></script>
     <style>
-        body { background: #0f0f1a; color: #e4e4f0; font-family: 'Inter', sans-serif; padding: 16px; margin: 0; }
-        .task-card { background: #1a1a2e; border-radius: 20px; padding: 18px 16px; margin-bottom: 14px; border: 1px solid #2a2a44; }
-        .task-title { font-size: 17px; font-weight: 600; }
-        .task-reward { color: #fbbf24; background: #2a2a44; padding: 2px 12px; border-radius: 30px; font-size: 14px; display: inline-block; }
-        .btn { border: none; border-radius: 40px; padding: 10px 24px; font-weight: 600; font-size: 14px; cursor: pointer; transition: 0.15s; min-width: 100px; }
-        .btn-start { background: #3b82f6; color: white; }
-        .btn-verify { background: #f59e0b; color: #0f0f1a; }
-        .btn-verify:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-claimed { background: #22c55e; color: white; cursor: default; opacity: 0.8; }
-        .timer-text { font-size: 13px; color: #94a3b8; margin-top: 6px; }
-        .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-        .balance-badge { background: #2a2a44; padding: 6px 16px; border-radius: 40px; font-size: 15px; font-weight: 500; }
-        .balance-badge span { color: #fbbf24; }
-        #debug { background: #1a1a2e; padding: 10px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; color: #94a3b8; border: 1px solid #2a2a44; display: none; }
+        body {
+            background: #0f0f1a;
+            color: #e4e4f0;
+            font-family: 'Inter', -apple-system, sans-serif;
+            padding: 16px;
+            margin: 0;
+        }
+        .task-card {
+            background: #1a1a2e;
+            border-radius: 20px;
+            padding: 18px 16px;
+            margin-bottom: 14px;
+            border: 1px solid #2a2a44;
+            transition: 0.2s;
+        }
+        .task-title {
+            font-size: 17px;
+            font-weight: 600;
+        }
+        .task-reward {
+            color: #fbbf24;
+            background: #2a2a44;
+            padding: 2px 12px;
+            border-radius: 30px;
+            font-size: 14px;
+            display: inline-block;
+        }
+        .btn {
+            border: none;
+            border-radius: 40px;
+            padding: 10px 24px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: 0.15s;
+            min-width: 100px;
+        }
+        .btn-start {
+            background: #3b82f6;
+            color: white;
+        }
+        .btn-start:active {
+            transform: scale(0.96);
+        }
+        .btn-verify {
+            background: #f59e0b;
+            color: #0f0f1a;
+        }
+        .btn-verify:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .btn-claimed {
+            background: #22c55e;
+            color: white;
+            cursor: default;
+            opacity: 0.8;
+        }
+        .btn-claimed:disabled {
+            opacity: 0.9;
+        }
+        .timer-text {
+            font-size: 13px;
+            color: #94a3b8;
+            margin-top: 6px;
+        }
+        .spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        .balance-badge {
+            background: #2a2a44;
+            padding: 6px 16px;
+            border-radius: 40px;
+            font-size: 15px;
+            font-weight: 500;
+        }
+        .balance-badge span {
+            color: #fbbf24;
+        }
+        #debug {
+            background: #1a1a2e;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 13px;
+            color: #94a3b8;
+            border: 1px solid #2a2a44;
+            display: none;
+        }
     </style>
 </head>
 <body>
     <div id="app" class="max-w-lg mx-auto">
         <div class="header">
             <h1 class="text-2xl font-bold">🎯 Earn</h1>
-            <div class="balance-badge">💰 <span id="userBalance">0</span> TRX</div>
+            <div class="balance-badge">💰 <span id="userBalance">0</span> Coins</div>
         </div>
         <div id="debug"></div>
         <div id="taskList"></div>
@@ -35,14 +128,16 @@
     </div>
 
     <script>
+        // Initialize Telegram WebApp
         const tg = window.Telegram.WebApp;
         tg.expand();
-        tg.ready(); // গুরুত্বপূর্ণ: WebApp লোড হওয়ার সংকেত দিন
+        tg.ready();
 
+        // Debug element
         const debugEl = document.getElementById('debug');
         const initData = tg.initData || '';
 
-        // ডিবাগ তথ্য দেখান
+        // Show debug info
         debugEl.style.display = 'block';
         if (initData) {
             debugEl.innerHTML = `✅ InitData received (length: ${initData.length})`;
@@ -56,39 +151,56 @@
             throw new Error('No initData');
         }
 
+        // DOM references
         const taskListEl = document.getElementById('taskList');
         const loadingEl = document.getElementById('loading');
         const balanceEl = document.getElementById('userBalance');
 
+        // --- API calls ---
         async function fetchTasks() {
-            const resp = await fetch(`/api/tasks?init_data=${encodeURIComponent(initData)}`);
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
-            return await resp.json();
+            try {
+                const resp = await fetch(`/api/tasks?init_data=${encodeURIComponent(initData)}`);
+                if (!resp.ok) {
+                    const errorText = await resp.text();
+                    throw new Error(`HTTP ${resp.status}: ${errorText}`);
+                }
+                return await resp.json();
+            } catch (err) {
+                console.error('Fetch tasks error:', err);
+                throw err;
+            }
         }
 
         async function verifyTask(taskId) {
-            const resp = await fetch('/api/verify-task', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_id: taskId, init_data: initData })
-            });
-            return await resp.json();
+            try {
+                const resp = await fetch('/api/verify-task', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_id: taskId, init_data: initData })
+                });
+                return await resp.json();
+            } catch (err) {
+                console.error('Verify task error:', err);
+                return { status: 'error', message: err.message };
+            }
         }
 
+        // --- Render tasks ---
         function renderTasks(data) {
             const tasks = data.tasks || [];
             const balance = data.balance || 0;
             balanceEl.textContent = balance.toFixed(1);
 
             if (tasks.length === 0) {
-                taskListEl.innerHTML = `<p class="text-center text-gray-400">No tasks available.</p>`;
+                taskListEl.innerHTML = `<p class="text-center text-gray-400">No tasks available right now.</p>`;
                 return;
             }
 
             let html = '';
             tasks.forEach(task => {
-                const status = task.status;
-                let btnHtml = '', timerHtml = '';
+                const status = task.status; // 'available', 'pending', 'claimed'
+                let btnHtml = '';
+                let timerHtml = '';
 
                 if (status === 'available') {
                     btnHtml = `<button class="btn btn-start" data-task-id="${task.id}" data-action="start">▶ Start</button>`;
@@ -104,7 +216,7 @@
                         <div class="flex justify-between items-start">
                             <div>
                                 <div class="task-title">${task.title}</div>
-                                <div class="task-reward mt-1">💰 ${task.reward} TRX</div>
+                                <div class="task-reward mt-1">💰 ${task.reward} Coins</div>
                             </div>
                             <div class="flex flex-col items-end">
                                 ${btnHtml}
@@ -117,6 +229,7 @@
 
             taskListEl.innerHTML = html;
 
+            // --- Event: Start button ---
             document.querySelectorAll('button[data-action="start"]').forEach(btn => {
                 btn.addEventListener('click', async function() {
                     const taskId = parseInt(this.dataset.taskId);
@@ -125,11 +238,13 @@
 
                     const result = await verifyTask(taskId);
                     if (result.status === 'pending') {
+                        // Change button to Verify with timer
                         this.textContent = '⏳ Verify';
                         this.className = 'btn btn-verify';
                         this.dataset.action = 'verify';
                         this.disabled = true;
 
+                        // Add timer display
                         const card = this.closest('.task-card');
                         let timerDiv = card.querySelector('.timer-text');
                         if (!timerDiv) {
@@ -146,6 +261,7 @@
                             if (remaining <= 0) {
                                 clearInterval(interval);
                                 timerDiv.textContent = '✅ Ready to verify!';
+                                // Enable verify button
                                 const verifyBtn = card.querySelector('button[data-action="verify"]');
                                 if (verifyBtn) {
                                     verifyBtn.disabled = false;
@@ -155,7 +271,7 @@
                                         this.textContent = '⏳ Verifying...';
                                         const res = await verifyTask(taskId);
                                         if (res.status === 'success') {
-                                            this.textContent = `✅ +${res.reward} TRX`;
+                                            this.textContent = `✅ +${res.reward} Coins`;
                                             this.className = 'btn btn-claimed';
                                             this.disabled = true;
                                             timerDiv.textContent = '🎉 Claimed!';
@@ -173,7 +289,8 @@
                         }, 1000);
 
                     } else if (result.status === 'success') {
-                        this.textContent = `✅ +${result.reward} TRX`;
+                        // Direct success (no timer needed)
+                        this.textContent = `✅ +${result.reward} Coins`;
                         this.className = 'btn btn-claimed';
                         this.disabled = true;
                         balanceEl.textContent = (parseFloat(balanceEl.textContent) + result.reward).toFixed(1);
@@ -186,6 +303,7 @@
             });
         }
 
+        // --- Initialization ---
         async function init() {
             try {
                 const data = await fetchTasks();
@@ -196,6 +314,8 @@
                 console.error(e);
             }
         }
+
+        // Run on page load
         init();
     </script>
 </body>
