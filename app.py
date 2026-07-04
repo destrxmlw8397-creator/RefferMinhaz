@@ -16,16 +16,17 @@ admin = Admin(
 )
 
 class AnnouncementAdmin(ModelView):
+    model = Announcement  # ← অত্যন্ত গুরুত্বপূর্ণ
     fields = ["title", "content"]
     search_fields = ["title", "content"]
     ordering = ["-created_at"]
 
 class BotConfigAdmin(ModelView):
+    model = BotConfig
     fields = ["key", "value"]
 
-# add_view ব্যবহার করে রেজিস্টার (register নয়)
-admin.add_view(AnnouncementAdmin(Announcement))
-admin.add_view(BotConfigAdmin(BotConfig))
+admin.add_view(AnnouncementAdmin())
+admin.add_view(BotConfigAdmin())
 admin.mount_to(app)
 
 # ========== ডাটাবেস ডিপেন্ডেন্সি ==========
