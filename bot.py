@@ -27,11 +27,9 @@ async def announcements_command(message: types.Message):
     session = SessionLocal()
     announcements = session.query(Announcement).order_by(Announcement.created_at.desc()).limit(5).all()
     session.close()
-    
     if not announcements:
         await message.answer("📭 কোনো ঘোষণা নেই।")
         return
-    
     text = "📢 **সর্বশেষ ঘোষণা:**\n\n"
     for ann in announcements:
         text += f"🔹 *{ann.title}*\n{ann.content[:200]}...\n\n"
