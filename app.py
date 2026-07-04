@@ -1,99 +1,49 @@
 import os
-from fastapi import FastAPI, Depends, Request
-from fastapi.responses import HTMLResponse
-from starlette_admin.contrib.sqla import Admin, ModelView
-from sqlalchemy.orm import Session
-from database import SessionLocal, Announcement, BotConfig
-from bot import dp, bot
+from fastapi import FastAPI
+from sqladmin import Admin, ModelView
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, Integer, String, Text, DateTime
+from datetime import datetime
 
-app = FastAPI(title="Telegram Bot WebApp")
+# ১. ডাটাবেজ এবং অ্যাপ কনফিগারেশন
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 
-# ========== অ্যাডমিন প্যানেল ==========
-admin = Admin(
-    engine=SessionLocal().get_bind(),
-    title="বট অ্যাডমিন প্যানেল",
-    base_url="/admin",
-)
+engine = create_async_engine(DATABASE_URL, echo=True)
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
 
-class AnnouncementAdmin(ModelView):
-    model = Announcement  # ← অত্যন্ত গুরুত্বপূর্ণ
-    fields = ["title", "content"]
-    search_fields = ["title", "content"]
-    ordering = ["-created_at"]
+app = FastAPI(title="RefferMinhaz API")
 
-class BotConfigAdmin(ModelView):
-    model = BotConfig
-    fields = ["key", "value"]
+# ২. ডাটাবেজ মডেল (Announcement)
+class Announcement(Base):
+    __tablename__ = "announcements"
 
-admin.add_view(AnnouncementAdmin())
-admin.add_view(BotConfigAdmin())
-admin.mount_to(app)
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-# ========== ডাটাবেস ডিপেন্ডেন্সি ==========
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# ৩. SQLAdmin ভিউ কনফিগারেশন
+# এখানেই মূল ভুলটি ছিল। `model=Announcement` ক্লাস ডিক্লেয়ারেশনের ভেতরেই পাস করতে হবে।
+class AnnouncementAdmin(ModelView, model=Announcement):
+    column_list = [Announcement.id, Announcement.title, Announcement.created_at]
+    form_columns = [Announcement.title, Announcement.content]
+    icon = "fa-solid fa-bullhorn"
 
-# ========== ওয়েব অ্যাপ (পাবলিক ভিউ) ==========
-@app.get("/", response_class=HTMLResponse)
-async def webapp_home(db: Session = Depends(get_db)):
-    announcements = db.query(Announcement).order_by(Announcement.created_at.desc()).limit(10).all()
-    
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>📢 ঘোষণা বোর্ড</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 15px; background: #f5f5f5; }
-            .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-            .title { font-size: 20px; font-weight: bold; color: #333; }
-            .date { color: #888; font-size: 14px; }
-            .content { margin-top: 10px; line-height: 1.6; }
-            .empty { text-align: center; color: #888; padding: 40px; }
-            h1 { text-align: center; color: #2c3e50; }
-        </style>
-    </head>
-    <body>
-        <h1>📢 ঘোষণা বোর্ড</h1>
-    """
-    
-    if announcements:
-        for ann in announcements:
-            html += f"""
-            <div class="card">
-                <div class="title">{ann.title}</div>
-                <div class="date">{ann.created_at.strftime('%d %b %Y, %I:%M %p')}</div>
-                <div class="content">{ann.content}</div>
-            </div>
-            """
-    else:
-        html += '<div class="empty">📭 এখনো কোনো ঘোষণা নেই</div>'
-    
-    html += """
-    </body>
-    </html>
-    """
-    return html
+# ৪. অ্যাডমিন প্যানেল ইনিশিয়ালাইজেশন
+admin = Admin(app, engine)
 
-# ========== ওয়েবহুক এন্ডপয়েন্ট ==========
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    update = await request.json()
-    await dp.feed_update(bot, update)
-    return {"ok": True}
+# সঠিকভাবে তৈরি করা ভিউটি অ্যাডমিনে যুক্ত করা হলো
+admin.add_view(AnnouncementAdmin) 
 
-# ========== বুটস্ট্র্যাপ ==========
+# ৫. বেসিক রাউটস (প্রয়োজনীয়তা অনুযায়ী)
+@app.get("/")
+async def root():
+    return {"message": "Server is running successfully!"}
+
+# ডাটাবেজ টেবিল তৈরি করার জন্য (যদি আগে থেকে তৈরি করা না থাকে)
 @app.on_event("startup")
-async def startup():
-    webhook_url = os.getenv("RENDER_EXTERNAL_URL") + "/webhook"
-    await bot.set_webhook(webhook_url)
-    print(f"✅ Webhook set to: {webhook_url}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
