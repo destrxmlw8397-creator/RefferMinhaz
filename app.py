@@ -5,7 +5,6 @@ from starlette_admin.contrib.sqla import Admin, ModelView
 from sqlalchemy.orm import Session
 from database import SessionLocal, Announcement, BotConfig
 from bot import dp, bot
-import asyncio
 
 app = FastAPI(title="Telegram Bot WebApp")
 
@@ -17,12 +16,17 @@ admin = Admin(
 )
 
 class AnnouncementAdmin(ModelView):
+    model = Announcement          # ← মডেল এখানে সংযুক্ত করুন
     fields = ["title", "content"]
     search_fields = ["title", "content"]
     ordering = ["-created_at"]
 
-admin.register(Announcement, AnnouncementAdmin)
-admin.register(BotConfig)
+class BotConfigAdmin(ModelView):
+    model = BotConfig
+    fields = ["key", "value"]
+
+admin.register(AnnouncementAdmin)   # ← শুধু অ্যাডমিন ক্লাস দিতে হবে
+admin.register(BotConfigAdmin)
 admin.mount_to(app)
 
 # ========== ডাটাবেস ডিপেন্ডেন্সি ==========
