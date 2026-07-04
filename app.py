@@ -1,7 +1,7 @@
 import os
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.responses import HTMLResponse
-from starlette_admin import create_admin
+from starlette_admin.contrib.sqla import Admin, ModelView
 from sqlalchemy.orm import Session
 from database import SessionLocal, Announcement, BotConfig
 from bot import dp, bot
@@ -10,8 +10,6 @@ import asyncio
 app = FastAPI(title="Telegram Bot WebApp")
 
 # ========== অ্যাডমিন প্যানেল ==========
-from starlette_admin.contrib.sqla import Admin, ModelView
-
 admin = Admin(
     engine=SessionLocal().get_bind(),
     title="বট অ্যাডমিন প্যানেল",
@@ -27,7 +25,7 @@ admin.register(Announcement, AnnouncementAdmin)
 admin.register(BotConfig)
 admin.mount_to(app)
 
-# ========== ওয়েব অ্যাপ (পাবলিক ভিউ) ==========
+# ========== ডাটাবেস ডিপেন্ডেন্সি ==========
 def get_db():
     db = SessionLocal()
     try:
@@ -35,6 +33,7 @@ def get_db():
     finally:
         db.close()
 
+# ========== ওয়েব অ্যাপ (পাবলিক ভিউ) ==========
 @app.get("/", response_class=HTMLResponse)
 async def webapp_home(db: Session = Depends(get_db)):
     announcements = db.query(Announcement).order_by(Announcement.created_at.desc()).limit(10).all()
@@ -77,7 +76,7 @@ async def webapp_home(db: Session = Depends(get_db)):
     """
     return html
 
-# ========== ওয়েবহুক সেটআপ (Render-এর জন্য) ==========
+# ========== ওয়েবহুক এন্ডপয়েন্ট ==========
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     update = await request.json()
