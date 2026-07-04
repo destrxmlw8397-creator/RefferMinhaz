@@ -5,12 +5,12 @@ from fastapi.responses import HTMLResponse
 from sqladmin import Admin, ModelView
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, func
 from datetime import datetime
 
 # Aiogram 3.x Imports
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, Update
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, Update, WebAppInfo
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -22,6 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789")) # আপনার টেলিগ্রাম আইডি
+WEBAPP_URL = "https://refferminhaz.onrender.com" # আপনার Render ডোমেইন URL
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -29,7 +30,7 @@ Base = declarative_base()
 
 app = FastAPI(title="RefferMinhaz System")
 
-# Aiogram Initialization (New V3 Syntax)
+# Aiogram Initialization
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -38,9 +39,8 @@ dp = Dispatcher(storage=MemoryStorage())
 # ==========================================
 class TGTask(Base):
     __tablename__ = "tg_tasks"
-
     id = Column(Integer, primary_key=True, index=True)
-    channel_username = Column(String(255), nullable=False) # e.g., @mychannel
+    channel_username = Column(String(255), nullable=False)
     reward_points = Column(Integer, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -63,7 +63,7 @@ admin = Admin(app, engine)
 admin.add_view(TGTaskAdmin)
 
 # ==========================================
-# ৪. FSM (States) এবং টেলিগ্রাম বট লজিক (Aiogram 3.x)
+# ৪. FSM (States) এবং টেলিগ্রাম বট লজিক (অ্যাডমিন পার্ট)
 # ==========================================
 class AdminStates(StatesGroup):
     awaiting_username = State()
@@ -77,18 +77,13 @@ async def send_admin_keyboard(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.reply("❌ আপনি এই বটের অ্যাডমিন নন।")
         return
-    
-    kb = [
-        [KeyboardButton(text="➕ Add TG Task")],
-        [KeyboardButton(text="➕ Add Media Task")]
-    ]
+    kb = [[KeyboardButton(text="➕ Add TG Task")], [KeyboardButton(text="➕ Add Media Task")]]
     markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     await message.answer("👋 অ্যাডমিন প্যানেলে স্বাগতম! নিচের যেকোনো একটি অপশন বেছে নিন:", reply_markup=markup)
 
 @dp.message(F.text == "➕ Add TG Task")
 async def ask_channel_username(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
-    
     await state.set_state(AdminStates.awaiting_username)
     await message.answer("📢 দয়া করে চ্যানেলের ইউজারনেম (যেমন: `@channelname`) অথবা ইনভাইট লিঙ্কটি দিন:")
 
@@ -96,80 +91,50 @@ async def ask_channel_username(message: types.Message, state: FSMContext):
 async def handle_channel_username(message: types.Message, state: FSMContext):
     username = message.text.strip()
     if not username.startswith("@") and "t.me/" not in username:
-        await message.answer("❌ ভুল ফরম্যাট! ইউজারনেমটি অবশ্যই `@` দিয়ে শুরু হতে হবে। আবার চেষ্টা করুন:")
+        await message.answer("❌ ভুল ফরম্যাট! আবার চেষ্টা করুন:")
         return
-    
     if "t.me/" in username:
         parsed = username.split("t.me/")[-1].replace("+", "")
         username = f"@{parsed}" if "/" not in parsed else username
 
     await state.update_data(username=username)
-    
-    inline_kb = [
-        [
-            InlineKeyboardButton(text="🔄 Check Admin Status", callback_data="check_admin"),
-            InlineKeyboardButton(text="🔙 Back", callback_data="back_to_admin")
-        ]
-    ]
-    markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
-    await message.answer(f"চ্যানেল: {username}\n\n⚠️ এই চ্যানেলে বটকে অবশ্যই 'Admin' হিসেবে যুক্ত করতে হবে। আপনি কি বটকে এডমিন করেছেন?", reply_markup=markup)
-
-@dp.callback_query(F.data == "back_to_admin")
-async def back_to_admin(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.delete()
-    # রেপ্লিজ-কিবোর্ড দেখানোর জন্য ট্রিক
-    kb = [[KeyboardButton(text="➕ Add TG Task")], [KeyboardButton(text="➕ Add Media Task")]]
-    await call.message.answer("👋 অ্যাডমিন প্যানেল:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    inline_kb = [[InlineKeyboardButton(text="🔄 Check Admin Status", callback_data="check_admin"), InlineKeyboardButton(text="🔙 Back", callback_data="back_to_admin")]]
+    await message.answer(f"চ্যানেল: {username}\n\n⚠️ বটকে এডমিন করেছেন?", reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_kb))
 
 @dp.callback_query(F.data == "check_admin")
 async def check_admin_status(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     username = data.get("username")
-    
     try:
         bot_info = await bot.get_me()
         member = await bot.get_chat_member(chat_id=username, user_id=bot_info.id)
         if member.status in ['administrator', 'creator']:
             await state.set_state(AdminStates.awaiting_reward)
-            await call.message.edit_text(f"✅ বট সফলভাবে এডমিন হিসেবে ভেরিফাইড হয়েছে!\n\n💰 এই টাস্কটি কমপ্লিট করলে ইউজার কত রিওয়ার্ড পয়েন্ট পাবে? (শুধুমাত্র সংখ্যা লিখুন):")
+            await call.message.edit_text(f"✅ বট সফলভাবে এডমিন ভেরিফাইড!\n\n💰 রিওয়ার্ড পয়েন্ট কত দিবেন? (শুধুমাত্র সংখ্যা লিখুন):")
         else:
             await call.answer("❌ বট এখনো এই চ্যানেলের এডমিন নয়!", show_alert=True)
     except Exception:
-        await call.answer("❌ চ্যানেলটি খুঁজে পাওয়া যায়নি বা বট এডমিন নয়। নিশ্চিত হয়ে আবার চেক করুন।", show_alert=True)
+        await call.answer("❌ চ্যানেলটি খুঁজে পাওয়া যায়নি বা বট এডমিন নয়।", show_alert=True)
 
 @dp.message(AdminStates.awaiting_reward)
 async def handle_reward_input(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if not text.isdigit():
-        await message.answer("❌ দয়া করে একটি সঠিক সংখ্যা দিন (যেমন: 50, 100):")
+        await message.answer("❌ দয়া করে একটি সঠিক সংখ্যা দিন:")
         return
-    
     await state.update_data(reward=int(text))
     data = await state.get_data()
-    
-    inline_kb = [
-        [
-            InlineKeyboardButton(text="✅ Confirm & Save", callback_data="confirm_task"),
-            InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")
-        ]
-    ]
-    markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
-    await message.answer(f"📝 **টাস্ক সামারি:**\n\n📢 চ্যানেল: {data['username']}\n💰 রিওয়ার্ড: {data['reward']} পয়েন্ট\n\nআপনি কি এটি সেভ করতে চান?", reply_markup=markup, parse_mode="Markdown")
+    inline_kb = [[InlineKeyboardButton(text="✅ Confirm & Save", callback_data="confirm_task"), InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")]]
+    await message.answer(f"📢 চ্যানেল: {data['username']}\n💰 রিওয়ার্ড: {data['reward']} পয়েন্ট\n\nসেভ করবেন?", reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_kb))
 
 @dp.callback_query(F.data == "confirm_task")
 async def confirm_task(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    username = data.get("username")
-    reward = data.get("reward")
-    
     async with async_session() as session:
         async with session.begin():
-            new_task = TGTask(channel_username=username, reward_points=int(reward))
-            session.add(new_task)
+            session.add(TGTask(channel_username=data.get("username"), reward_points=data.get("reward")))
         await session.commit()
-        
-    await call.message.edit_text(f"🎉 টাস্কটি সফলভাবে যোগ করা হয়েছে!\n📢 চ্যানেল: {username}\n💰 রিওয়ার্ড: {reward} পয়েন্ট")
+    await call.message.edit_text("🎉 টাস্কটি সফলভাবে যোগ করা হয়েছে!")
     await state.clear()
 
 @dp.callback_query(F.data == "cancel_task")
@@ -178,18 +143,60 @@ async def cancel_task(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("❌ টাস্ক বাতিল করা হয়েছে।")
 
 # ==========================================
-# ৫. WebApp এবং API রাউটস (FastAPI)
+# 🆕 ৬. ইউজার মেনু লজিক (/start, Balance, Task)
+# ==========================================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    kb = [
+        [KeyboardButton(text="💰 Balance"), KeyboardButton(text="🎯 Task")]
+    ]
+    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    await message.answer(f"👋 স্বাগতম {message.from_user.first_name}!\nআমাদের বটের মাধ্যমে বিভিন্ন টাস্ক পূরণ করে সহজে কয়েন/পয়েন্ট আর্ন করুন।", reply_markup=markup)
+
+@dp.message(F.text == "💰 Balance")
+async def check_user_balance(message: types.Message):
+    user_id = message.from_user.id
+    async with async_session() as session:
+        from sqlalchemy import select
+        # ইউজারের কমপ্লিট করা টাস্কগুলোর পয়েন্ট যোগ করা হচ্ছে
+        query = select(func.sum(TGTask.reward_points)).join(
+            UserProgress, TGTask.id == UserProgress.task_id
+        ).where(UserProgress.user_id == user_id, UserProgress.completed == True)
+        
+        result = await session.execute(query)
+        total_balance = result.scalar() or 0
+        
+    await message.answer(f"👤 **ইউজার:** {message.from_user.first_name}\n💵 **আপনার মোট ব্যালেন্স:** {total_balance} পয়েন্ট")
+
+@dp.message(F.text == "🎯 Task")
+async def show_tasks_menu(message: types.Message):
+    user_id = message.from_user.id
+    # WebApp এ ডিরেক্ট ইউজার আইডি প্যারামিটার হিসেবে পাস করা হচ্ছে
+    webapp_link = f"{WEBAPP_URL}/webapp?user_id={user_id}"
+    
+    inline_kb = [
+        [InlineKeyboardButton(text="📢 TG Task (Open WebApp)", web_app=WebAppInfo(url=webapp_link))],
+        [InlineKeyboardButton(text="🎬 Media Task", callback_data="media_task_clicked")]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
+    await message.answer("👇 নিচে দেওয়া টাস্কগুলো পূরণ করে আর্নিং শুরু করুন:", reply_markup=markup)
+
+@dp.callback_query(F.data == "media_task_clicked")
+async def media_task_msg(call: types.CallbackQuery):
+    await call.answer("⏳ Media Task বর্তমানে খালি আছে। খুব শীঘ্রই আসবে!", show_alert=True)
+
+# ==========================================
+# ৭. WebApp এবং API রাউটস (FastAPI)
 # ==========================================
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    # Aiogram 3.x Webhook Handler
     json_str = await request.json()
     update = Update.model_validate(json_str, context={"bot": bot})
     await dp.feed_update(bot, update)
     return {"status": "ok"}
 
 @app.get("/webapp", response_class=HTMLResponse)
-async def webapp_ui(user_id: int = 123456):
+async def webapp_ui(user_id: int):
     async with async_session() as session:
         from sqlalchemy import select
         result = await session.execute(select(TGTask))
@@ -201,15 +208,15 @@ async def webapp_ui(user_id: int = 123456):
         link = f"https://t.me/{clean_name}"
         
         tasks_html += f"""
-        <div style="border: 1px solid #ccc; padding: 15px; margin: 10px 0; border-radius: 8px; background: #fff;">
-            <h4>📢 Join Channel: {task.channel_username}</h4>
-            <p>💰 Reward: <b>{task.reward_points} Points</b></p>
+        <div style="border: 1px solid #eee; padding: 15px; margin: 12px 0; border-radius: 10px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+            <h4 style="margin: 0 0 5px 0; color: #333;">📢 Join: {task.channel_username}</h4>
+            <p style="margin: 0 0 10px 0; color: #28a745; font-weight: bold;">💰 +{task.reward_points} Points</p>
             <a href="{link}" target="_blank" onclick="document.getElementById('btn-{task.id}').disabled=false;" 
-               style="background: #0088cc; color: #fff; padding: 8px 15px; text-decoration: none; border-radius: 5px; display: inline-block;">
-               👉 Click to Join
+               style="background: #0088cc; color: #fff; padding: 8px 16px; text-decoration: none; border-radius: 6px; display: inline-block; font-size: 14px;">
+               👉 Join Channel
             </a>
             <button id="btn-{task.id}" disabled onclick="claimReward({task.id}, {user_id})"
-               style="background: #28a745; color: #fff; padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer; margin-left: 10px;">
+               style="background: #28a745; color: #fff; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; margin-left: 8px; font-size: 14px;">
                ✅ Joined (Claim)
             </button>
         </div>
@@ -222,9 +229,9 @@ async def webapp_ui(user_id: int = 123456):
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <script src="https://telegram.org/js/telegram-web-app.js"></script>
         </head>
-        <body style="font-family: Arial, sans-serif; background: #f4f4f9; padding: 20px;">
-            <h2>🌟 Telegram Tasks</h2>
-            <div id="tasks-container">{tasks_html if tasks_html else "<p>No active tasks available.</p>"}</div>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #f9f9f9; padding: 15px; margin: 0;">
+            <h3 style="color: #222; border-bottom: 2px solid #0088cc; padding-bottom: 8px;">🌟 Available Channels</h3>
+            <div id="tasks-container">{tasks_html if tasks_html else "<p style='color:#777;'>No active tasks available right now.</p>"}</div>
             
             <script>
                 const tg = window.Telegram.WebApp;
@@ -237,6 +244,7 @@ async def webapp_ui(user_id: int = 123456):
                     if (data.success) {{
                         document.getElementById(`btn-${{taskId}}`).innerText = "💰 Claimed";
                         document.getElementById(`btn-${{taskId}}`).disabled = true;
+                        document.getElementById(`btn-${{taskId}}`).style.background = "#6c757d";
                     }}
                 }}
             </script>
@@ -260,7 +268,6 @@ async def claim_reward(task_id: int, user_id: int):
             return {"success": False, "message": "You have already claimed this reward!"}
 
         try:
-            # Aiogram 3.x async chat member check
             member = await bot.get_chat_member(chat_id=task.channel_username, user_id=user_id)
             if member.status in ['member', 'administrator', 'creator']:
                 if not progress:
@@ -268,17 +275,16 @@ async def claim_reward(task_id: int, user_id: int):
                     session.add(progress)
                 else:
                     progress.completed = True
-                
                 await session.commit()
                 return {"success": True, "message": f"Success! {task.reward_points} points added!"}
             else:
                 return {"success": False, "message": "You haven't joined the channel yet!"}
         except Exception:
-            return {"success": False, "message": "Could not verify membership. Ensure the bot is admin in that channel!"}
+            return {"success": False, "message": "Could not verify membership. Ensure bot is admin in the channel!"}
 
 @app.get("/")
 async def root():
-    return {"message": "Server running with Aiogram 3.x! WebApp at /webapp"}
+    return {"message": "Server running! WebApp at /webapp"}
 
 @app.on_event("startup")
 async def on_startup():
