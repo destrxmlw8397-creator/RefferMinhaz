@@ -9,3 +9,6 @@ aiofiles==24.1.0
 pydantic==2.10.4
 sqladmin
 aiosqlite
+greenlet
+requests
+certifi
