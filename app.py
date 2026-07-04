@@ -23,7 +23,7 @@ class AnnouncementAdmin(ModelView):
 class BotConfigAdmin(ModelView):
     fields = ["key", "value"]
 
-# সঠিক register সিনট্যাক্স (মডেল, ভিউ ক্লাস)
+# সঠিক register
 admin.register(Announcement, AnnouncementAdmin)
 admin.register(BotConfig, BotConfigAdmin)
 admin.mount_to(app)
