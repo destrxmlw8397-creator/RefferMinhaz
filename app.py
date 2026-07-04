@@ -16,17 +16,16 @@ admin = Admin(
 )
 
 class AnnouncementAdmin(ModelView):
-    model = Announcement          # ← মডেল এখানে সংযুক্ত করুন
     fields = ["title", "content"]
     search_fields = ["title", "content"]
     ordering = ["-created_at"]
 
 class BotConfigAdmin(ModelView):
-    model = BotConfig
     fields = ["key", "value"]
 
-admin.register(AnnouncementAdmin)   # ← শুধু অ্যাডমিন ক্লাস দিতে হবে
-admin.register(BotConfigAdmin)
+# সঠিক register সিনট্যাক্স (মডেল, ভিউ ক্লাস)
+admin.register(Announcement, AnnouncementAdmin)
+admin.register(BotConfig, BotConfigAdmin)
 admin.mount_to(app)
 
 # ========== ডাটাবেস ডিপেন্ডেন্সি ==========
