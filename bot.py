@@ -9,13 +9,14 @@ dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
+    webapp_url = os.getenv("WEBAPP_URL")
     await message.answer(
         "👋 স্বাগতম! আমাদের ওয়েব অ্যাপ দেখতে নিচের বাটনে ক্লিক করুন।",
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [types.InlineKeyboardButton(
                     text="🌐 ওয়েব অ্যাপ খুলুন",
-                    web_app=types.WebAppInfo(url=os.getenv("WEBAPP_URL"))
+                    web_app=types.WebAppInfo(url=webapp_url)
                 )]
             ]
         )
