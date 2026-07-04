@@ -23,9 +23,9 @@ class AnnouncementAdmin(ModelView):
 class BotConfigAdmin(ModelView):
     fields = ["key", "value"]
 
-# সঠিক register
-admin.register(Announcement, AnnouncementAdmin)
-admin.register(BotConfig, BotConfigAdmin)
+# add_view ব্যবহার করে রেজিস্টার (register নয়)
+admin.add_view(AnnouncementAdmin(Announcement))
+admin.add_view(BotConfigAdmin(BotConfig))
 admin.mount_to(app)
 
 # ========== ডাটাবেস ডিপেন্ডেন্সি ==========
