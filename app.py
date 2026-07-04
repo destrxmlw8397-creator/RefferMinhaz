@@ -1,28 +1,37 @@
 import os
-import re
+import asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from sqladmin import Admin, ModelView
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from datetime import datetime
-import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+
+# Aiogram 3.x Imports
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, Update
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # ==========================================
 # ১. কনফিগারেশন এবং ডাটাবেজ সেটআপ
 # ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN") # Render Environment Variable এ সেট করবেন
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789")) # আপনার টেলিগ্রাম ইউজার আইডি
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789")) # আপনার টেলিগ্রাম আইডি
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 app = FastAPI(title="RefferMinhaz System")
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+
+# Aiogram Initialization (New V3 Syntax)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
 # ==========================================
 # ২. ডাটাবেজ মডেলস (Models)
@@ -54,147 +63,140 @@ admin = Admin(app, engine)
 admin.add_view(TGTaskAdmin)
 
 # ==========================================
-# ৪. টেলিগ্রাম বট লজিক (অ্যাডমিন পার্ট)
+# ৪. FSM (States) এবং টেলিগ্রাম বট লজিক (Aiogram 3.x)
 # ==========================================
-# সাময়িক ডেটা স্টোর করার জন্য মেমোরি ডিকশনারি
-admin_states = {}
+class AdminStates(StatesGroup):
+    awaiting_username = State()
+    awaiting_reward = State()
 
-def is_admin(chat_id):
-    return chat_id == ADMIN_ID
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
-@bot.message_handler(commands=['admin'])
-def send_admin_keyboard(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "❌ আপনি এই বটের অ্যাডমিন নন।")
+@dp.message(Command("admin"))
+async def send_admin_keyboard(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("❌ আপনি এই বটের অ্যাডমিন নন।")
         return
     
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(KeyboardButton("➕ Add TG Task"), KeyboardButton("➕ Add Media Task"))
-    bot.send_message(message.chat.id, "👋 অ্যাডমিন প্যানেলে স্বাগতম! নিচের যেকোনো একটি অপশন বেছে নিন:", reply_markup=markup)
+    kb = [
+        [KeyboardButton(text="➕ Add TG Task")],
+        [KeyboardButton(text="➕ Add Media Task")]
+    ]
+    markup = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    await message.answer("👋 অ্যাডমিন প্যানেলে স্বাগতম! নিচের যেকোনো একটি অপশন বেছে নিন:", reply_markup=markup)
 
-@bot.message_handler(func=lambda message: message.text == "➕ Add TG Task")
-def ask_channel_username(message):
-    if not is_admin(message.chat.id): return
+@dp.message(F.text == "➕ Add TG Task")
+async def ask_channel_username(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
     
-    admin_states[message.chat.id] = {"state": "AWAITING_USERNAME"}
-    bot.send_message(message.chat.id, "📢 দয়া করে চ্যানেলের ইউজারনেম (যেমন: `@channelname`) অথবা ইনভাইট লিঙ্কটি দিন:")
+    await state.set_state(AdminStates.awaiting_username)
+    await message.answer("📢 দয়া করে চ্যানেলের ইউজারনেম (যেমন: `@channelname`) অথবা ইনভাইট লিঙ্কটি দিন:")
 
-@bot.message_handler(func=lambda message: admin_states.get(message.chat.id, {}).get("state") == "AWAITING_USERNAME")
-def handle_channel_username(message):
-    if not is_admin(message.chat.id): return
-    
+@dp.message(AdminStates.awaiting_username)
+async def handle_channel_username(message: types.Message, state: FSMContext):
     username = message.text.strip()
     if not username.startswith("@") and "t.me/" not in username:
-        bot.send_message(message.chat.id, "❌ ভুল ফরম্যাট! ইউজারনেমটি অবশ্যই `@` দিয়ে শুরু হতে হবে অথবা একটি বৈধ টেলিগ্রাম লিঙ্ক হতে হবে। আবার চেষ্টা করুন:")
+        await message.answer("❌ ভুল ফরম্যাট! ইউজারনেমটি অবশ্যই `@` দিয়ে শুরু হতে হবে। আবার চেষ্টা করুন:")
         return
     
-    # ইউজারনেম এক্সট্রাক্ট করা (যদি লিঙ্ক দেয়)
     if "t.me/" in username:
         parsed = username.split("t.me/")[-1].replace("+", "")
         username = f"@{parsed}" if "/" not in parsed else username
 
-    admin_states[message.chat.id]["username"] = username
-    admin_states[message.chat.id]["state"] = "AWAITING_VERIFICATION"
+    await state.update_data(username=username)
     
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔄 Check Admin Status", callback_data="check_admin"),
-               InlineKeyboardButton("🔙 Back", callback_data="back_to_admin"))
+    inline_kb = [
+        [
+            InlineKeyboardButton(text="🔄 Check Admin Status", callback_data="check_admin"),
+            InlineKeyboardButton(text="🔙 Back", callback_data="back_to_admin")
+        ]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
+    await message.answer(f"চ্যানেল: {username}\n\n⚠️ এই চ্যানেলে বটকে অবশ্যই 'Admin' হিসেবে যুক্ত করতে হবে। আপনি কি বটকে এডমিন করেছেন?", reply_markup=markup)
+
+@dp.callback_query(F.data == "back_to_admin")
+async def back_to_admin(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
+    # রেপ্লিজ-কিবোর্ড দেখানোর জন্য ট্রিক
+    kb = [[KeyboardButton(text="➕ Add TG Task")], [KeyboardButton(text="➕ Add Media Task")]]
+    await call.message.answer("👋 অ্যাডমিন প্যানেল:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+
+@dp.callback_query(F.data == "check_admin")
+async def check_admin_status(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    username = data.get("username")
     
-    bot.send_message(message.chat.id, f"চ্যানেল: {username}\n\n⚠️ এই চ্যানেলে বটকে অবশ্যই 'Admin' হিসেবে যুক্ত করতে হবে। আপনি কি বটকে এডমিন করেছেন?", reply_markup=markup)
+    try:
+        bot_info = await bot.get_me()
+        member = await bot.get_chat_member(chat_id=username, user_id=bot_info.id)
+        if member.status in ['administrator', 'creator']:
+            await state.set_state(AdminStates.awaiting_reward)
+            await call.message.edit_text(f"✅ বট সফলভাবে এডমিন হিসেবে ভেরিফাইড হয়েছে!\n\n💰 এই টাস্কটি কমপ্লিট করলে ইউজার কত রিওয়ার্ড পয়েন্ট পাবে? (শুধুমাত্র সংখ্যা লিখুন):")
+        else:
+            await call.answer("❌ বট এখনো এই চ্যানেলের এডমিন নয়!", show_alert=True)
+    except Exception:
+        await call.answer("❌ চ্যানেলটি খুঁজে পাওয়া যায়নি বা বট এডমিন নয়। নিশ্চিত হয়ে আবার চেক করুন।", show_alert=True)
 
-@bot.callback_query_handler(func=lambda call: call.data in ["check_admin", "back_to_admin", "confirm_task", "cancel_task"])
-def callback_handler(call):
-    chat_id = call.message.chat.id
-    state_data = admin_states.get(chat_id, {})
-
-    if call.data == "back_to_admin":
-        admin_states.pop(chat_id, None)
-        bot.delete_message(chat_id, call.message.message_id)
-        send_admin_keyboard(call.message)
-        return
-
-    if call.data == "check_admin":
-        username = state_data.get("username")
-        try:
-            # বট নিজে ঐ চ্যানেলের এডমিন কিনা চেক করার চেষ্টা করবে
-            member = bot.get_chat_member(username, bot.get_me().id)
-            if member.status in ['administrator', 'creator']:
-                state_data["state"] = "AWAITING_REWARD"
-                bot.edit_message_text(f"✅ বট সফলভাবে এডমিন হিসেবে ভেরিফাইড হয়েছে!\n\n💰 এই টাস্কটি কমপ্লিট করলে ইউজার কত রিওয়ার্ড পয়েন্ট পাবে? (শুধুমাত্র সংখ্যা লিখুন, যেমন: `50`):", chat_id, call.message.message_id)
-            else:
-                bot.answer_callback_query(call.id, "❌ বট এখনো এই চ্যানেলের এডমিন নয়!", show_alert=True)
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ চ্যানেলটি খুঁজে পাওয়া যায়নি বা বট এডমিন নয়। নিশ্চিত হয়ে আবার চেক করুন।", show_alert=True)
-
-    elif call.data == "confirm_task":
-        # ডাটাবেজে সেভ করার জন্য উইন্ডো ওপেন (FastAPI এর মাধ্যমে রানিং থাকায় সিঙ্ক ওয়েতে টাস্ক পুশ)
-        username = state_data.get("username")
-        reward = state_data.get("reward")
-        
-        # সিঙ্ক ইভেন্ট লুপের বাইরে থাকায় আলাদা মেকানিজম বা ডিরেক্ট এঞ্জিন এক্সিকিউশন
-        import asyncio
-        async def save_task():
-            async with async_session() as session:
-                async with session.begin():
-                    new_task = TGTask(channel_username=username, reward_points=int(reward))
-                    session.add(new_task)
-                await session.commit()
-        
-        asyncio.run(save_task())
-        bot.edit_message_text(f"🎉 টাস্কটি সফলভাবে যোগ করা হয়েছে!\n📢 চ্যানেল: {username}\n💰 রিওয়ার্ড: {reward} পয়েন্ট", chat_id, call.message.message_id)
-        admin_states.pop(chat_id, None)
-
-    elif call.data == "cancel_task":
-        admin_states.pop(chat_id, None)
-        bot.edit_message_text("❌ টাস্ক বাতিল করা হয়েছে।", chat_id, call.message.message_id)
-
-@bot.message_handler(func=lambda message: admin_states.get(message.chat.id, {}).get("state") == "AWAITING_REWARD")
-def handle_reward_input(message):
-    if not is_admin(message.chat.id): return
-    
+@dp.message(AdminStates.awaiting_reward)
+async def handle_reward_input(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if not text.isdigit():
-        bot.send_message(message.chat.id, "❌ দয়া করে একটি সঠিক সংখ্যা দিন (যেমন: 50, 100):")
+        await message.answer("❌ দয়া করে একটি সঠিক সংখ্যা দিন (যেমন: 50, 100):")
         return
     
-    admin_states[message.chat.id]["reward"] = int(text)
-    admin_states[message.chat.id]["state"] = "CONFIRMATION"
+    await state.update_data(reward=int(text))
+    data = await state.get_data()
     
-    username = admin_states[message.chat.id]["username"]
-    reward = admin_states[message.chat.id]["reward"]
+    inline_kb = [
+        [
+            InlineKeyboardButton(text="✅ Confirm & Save", callback_data="confirm_task"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_task")
+        ]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=inline_kb)
+    await message.answer(f"📝 **টাস্ক সামারি:**\n\n📢 চ্যানেল: {data['username']}\n💰 রিওয়ার্ড: {data['reward']} পয়েন্ট\n\nআপনি কি এটি সেভ করতে চান?", reply_markup=markup, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "confirm_task")
+async def confirm_task(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    username = data.get("username")
+    reward = data.get("reward")
     
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ Confirm & Save", callback_data="confirm_task"),
-               InlineKeyboardButton("❌ Cancel", callback_data="cancel_task"))
-    
-    bot.send_message(message.chat.id, f"📝 **টাস্ক সামারি:**\n\n📢 চ্যানেল: {username}\n💰 রিওয়ার্ড: {reward} পয়েন্ট\n\nআপনি কি এটি সেভ করতে চান?", reply_markup=markup, parse_mode="Markdown")
+    async with async_session() as session:
+        async with session.begin():
+            new_task = TGTask(channel_username=username, reward_points=int(reward))
+            session.add(new_task)
+        await session.commit()
+        
+    await call.message.edit_text(f"🎉 টাস্কটি সফলভাবে যোগ করা হয়েছে!\n📢 চ্যানেল: {username}\n💰 রিওয়ার্ড: {reward} পয়েন্ট")
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_task")
+async def cancel_task(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("❌ টাস্ক বাতিল করা হয়েছে।")
 
 # ==========================================
-# ৫. WebApp এবং API রাউটস (User Part)
+# ৫. WebApp এবং API রাউটস (FastAPI)
 # ==========================================
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
+    # Aiogram 3.x Webhook Handler
     json_str = await request.json()
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
+    update = Update.model_validate(json_str, context={"bot": bot})
+    await dp.feed_update(bot, update)
     return {"status": "ok"}
 
-# ইউজারদের জন্য ডেমো WebApp ইন্টারফেস (টাস্ক লিস্ট ও ক্লায়েন্ট সাইড ভেরিফিকেশন)
 @app.get("/webapp", response_class=HTMLResponse)
 async def webapp_ui(user_id: int = 123456):
-    # ডাটাবেজ থেকে সমস্ত অ্যাক্টিভ টেলিগ্রাম টাস্ক তুলে আনা
-    import asyncio
-    async def get_tasks():
-        async with async_session() as session:
-            from sqlalchemy import select
-            result = await session.execute(select(TGTask))
-            return result.scalars().all()
-    
-    tasks = await asyncio.run(get_tasks())
+    async with async_session() as session:
+        from sqlalchemy import select
+        result = await session.execute(select(TGTask))
+        tasks = result.scalars().all()
     
     tasks_html = ""
     for task in tasks:
-        # টেলিগ্রাম লিঙ্ক জেনারেট করা
         clean_name = task.channel_username.replace("@", "")
         link = f"https://t.me/{clean_name}"
         
@@ -246,23 +248,21 @@ async def webapp_ui(user_id: int = 123456):
 async def claim_reward(task_id: int, user_id: int):
     async with async_session() as session:
         from sqlalchemy import select
-        # ১. টাস্ক ইনফো নেওয়া
+        
         task_res = await session.execute(select(TGTask).where(TGTask.id == task_id))
         task = task_res.scalar_one_or_none()
         if not task:
             return {"success": False, "message": "Task not found!"}
 
-        # ২. অলরেডি কমপ্লিট করেছে কিনা চেক
         prog_res = await session.execute(select(UserProgress).where(UserProgress.user_id == user_id, UserProgress.task_id == task_id))
         progress = prog_res.scalar_one_or_none()
         if progress and progress.completed:
             return {"success": False, "message": "You have already claimed this reward!"}
 
-        # ৩. টেলিগ্রাম এপিআই দিয়ে রিয়েল-টাইম চেক করা (ইউজার সত্যি চ্যানেলে আছে কিনা)
         try:
-            member = bot.get_chat_member(task.channel_username, user_id)
+            # Aiogram 3.x async chat member check
+            member = await bot.get_chat_member(chat_id=task.channel_username, user_id=user_id)
             if member.status in ['member', 'administrator', 'creator']:
-                # ডাটাবেজে এন্ট্রি করা এবং পয়েন্ট যোগ করার লজিক (এখানে Progress টেবিলে সেভ হচ্ছে)
                 if not progress:
                     progress = UserProgress(user_id=user_id, task_id=task_id, completed=True)
                     session.add(progress)
@@ -270,15 +270,15 @@ async def claim_reward(task_id: int, user_id: int):
                     progress.completed = True
                 
                 await session.commit()
-                return {"success": True, "message": f"Success! {task.reward_points} points added to your balance."}
+                return {"success": True, "message": f"Success! {task.reward_points} points added!"}
             else:
                 return {"success": False, "message": "You haven't joined the channel yet!"}
         except Exception:
-            return {"success": False, "message": "Could not verify your membership. Make sure you joined!"}
+            return {"success": False, "message": "Could not verify membership. Ensure the bot is admin in that channel!"}
 
 @app.get("/")
 async def root():
-    return {"message": "Server is running! WebApp is available at /webapp"}
+    return {"message": "Server running with Aiogram 3.x! WebApp at /webapp"}
 
 @app.on_event("startup")
 async def on_startup():
